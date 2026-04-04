@@ -1,0 +1,40 @@
+{
+  "schema_version": "v2",
+  "likert_scale": {
+    "num_categories": 5,
+    "labels": ["Strongly disagree", "Disagree", "Neutral", "Agree", "Strongly agree"],
+    "default_thresholds": [-1.5, -0.5, 0.5, 1.5],
+    "default_noise_var": 1.0
+  },
+  "notes": "Starter bank for real-user pilot. inference_pool is eligible for adaptive selection; heldout_pool is reserved for evaluation and should not be used to update the posterior.",
+  "inference_pool": [
+    {"id": "o_01", "text": "I enjoy exploring new ideas and concepts.", "w": [1, 0, 0, 0, 0]},
+    {"id": "o_02", "text": "I like trying unfamiliar activities.", "w": [1, 0, 0, 0, 0]},
+    {"id": "o_03", "text": "I often think about abstract topics.", "w": [1, 0, 0, 0, 0]},
+    {"id": "o_04", "text": "I enjoy creative or artistic hobbies.", "w": [1, 0, 0, 0, 0]},
+    {"id": "c_01", "text": "I keep my workspace organized.", "w": [0, 1, 0, 0, 0]},
+    {"id": "c_02", "text": "I plan tasks carefully before starting them.", "w": [0, 1, 0, 0, 0]},
+    {"id": "c_03", "text": "I follow through on commitments.", "w": [0, 1, 0, 0, 0]},
+    {"id": "c_04", "text": "I pay attention to small details.", "w": [0, 1, 0, 0, 0]},
+    {"id": "e_01", "text": "I feel energized when I am around other people.", "w": [0, 0, 1, 0, 0]},
+    {"id": "e_02", "text": "I enjoy being the center of attention.", "w": [0, 0, 1, 0, 0]},
+    {"id": "e_03", "text": "I start conversations easily.", "w": [0, 0, 1, 0, 0]},
+    {"id": "e_04", "text": "I enjoy social gatherings.", "w": [0, 0, 1, 0, 0]},
+    {"id": "a_01", "text": "I try to be considerate of other people's feelings.", "w": [0, 0, 0, 1, 0]},
+    {"id": "a_02", "text": "I am willing to compromise to avoid conflict.", "w": [0, 0, 0, 1, 0]},
+    {"id": "a_03", "text": "I try to help people when they need it.", "w": [0, 0, 0, 1, 0]},
+    {"id": "cx_oe_01", "text": "I enjoy lively group discussions about abstract or unconventional ideas.", "w": [0.7, 0, 0.7, 0, 0]},
+    {"id": "cx_ca_01", "text": "I take my responsibilities to others seriously and follow through on them.", "w": [0, 0.6, 0, 0.6, 0]},
+    {"id": "cx_ea_01", "text": "I enjoy getting to know new people and making them feel welcome.", "w": [0, 0, 0.7, 0.7, 0]},
+    {"id": "cx_on_01", "text": "I tend to see new challenges as exciting opportunities rather than threats.", "w": [0.6, 0, 0, 0, -0.6]},
+    {"id": "cx_nc_01", "text": "I often feel too stressed to stay on top of my responsibilities.", "w": [0, -0.5, 0, 0, 0.8]},
+    {"id": "cx_ce_01", "text": "I enjoy taking the lead on group projects and making sure they run well.", "w": [0, 0.6, 0.6, 0, 0]}
+  ],
+  "heldout_pool": [
+    {"id": "a_04", "text": "I generally trust other people.", "w": [0, 0, 0, 1, 0]},
+    {"id": "n_01", "text": "I often feel anxious or worried.", "w": [0, 0, 0, 0, 1]},
+    {"id": "n_02", "text": "I get stressed easily.", "w": [0, 0, 0, 0, 1]},
+    {"id": "n_03", "text": "I tend to overthink problems.", "w": [0, 0, 0, 0, 1]},
+    {"id": "n_04", "text": "I feel emotionally overwhelmed sometimes.", "w": [0, 0, 0, 0, 1]}
+  ]
+}
