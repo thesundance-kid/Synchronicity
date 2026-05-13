@@ -18,7 +18,7 @@ import numpy as np
 from app import db
 from models.personality_state import PersonalityState
 from models.question_bank import DEFAULT_THRESHOLDS, Question, load_question_pools_v2
-from models.question_generation import DummyLLMClient
+from models.question_generation import make_llm_client
 from models.question_pool_builder import build_generated_pool, build_session_inference_pool
 from models.question_selection import expected_information_gain, select_next_question_eig
 from models.real_eval import evaluate_heldout_performance
@@ -182,6 +182,8 @@ def create_session(
     dim: int = 5,
     fixed_order_ids: Optional[Sequence[str]] = None,
     llm_client: Any = None,
+    llm_api_key: Optional[str] = None,
+    llm_model: Optional[str] = None,
     n_generation_candidates: int = 10,
     nn_k: int = 3,
 ) -> Tuple[str, QuestionPayload]:
@@ -191,6 +193,11 @@ def create_session(
     V2-lite: experiment arm is assigned from ``session_id``; ``seed_plus_generated`` arm may
     append LLM-generated items (with ``w`` from nearest-neighbor assignment). The combined
     inference pool is stored and used for EIG / fixed-order selection.
+
+    LLM client priority (highest to lowest):
+    1. Explicit ``llm_client`` argument (e.g. for tests).
+    2. ``AnthropicLLMClient`` built from ``llm_api_key`` / ``llm_model``.
+    3. ``DummyLLMClient`` (no network calls) when neither is supplied.
     """
     inference_seed, heldout_pool, _ = load_bank(questions_v2_path, expected_dim=dim)
 
@@ -213,14 +220,25 @@ def create_session(
     use_generated = should_use_generated_questions(arm)
     generated_stored: Optional[List[Dict[str, Any]]] = None
     if use_generated:
-        client = llm_client if llm_client is not None else DummyLLMClient()
-        gen_list = build_generated_pool(
-            client,
-            seeds_for_generation,
-            n_candidates=n_generation_candidates,
-            k=nn_k,
-        )
-        generated_stored = [_jsonable_question_dict(x) for x in gen_list]
+        if llm_client is not None:
+            client = llm_client
+        else:
+            client = make_llm_client(api_key=llm_api_key, model=llm_model)
+        try:
+            gen_list = build_generated_pool(
+                client,
+                seeds_for_generation,
+                n_candidates=n_generation_candidates,
+                k=nn_k,
+            )
+            generated_stored = [_jsonable_question_dict(x) for x in gen_list]
+        except Exception as exc:  # noqa: BLE001
+            import warnings
+            warnings.warn(
+                f"LLM question generation failed; falling back to seeds only. Error: {exc}",
+                stacklevel=2,
+            )
+            generated_stored = None
 
     final_inference_dicts = build_session_inference_pool(seed_stored, generated_stored if use_generated else None)
     inference_ids = {d["id"] for d in final_inference_dicts}

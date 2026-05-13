@@ -29,6 +29,8 @@ def _env(name: str, default: str) -> str:
 DB_PATH = _env("PILOT_DB_PATH", os.path.join("data", "pilot.db"))
 QUESTIONS_PATH = _env("QUESTIONS_PATH", os.path.join("data", "questions_v2.json"))
 LATENT_DIM = int(os.environ.get("LATENT_DIM", "5"))
+ANTHROPIC_API_KEY = _env("ANTHROPIC_API_KEY", "")   # empty string → DummyLLMClient
+LLM_MODEL = _env("LLM_MODEL", "")                   # empty string → DEFAULT_LLM_MODEL
 
 
 app = FastAPI(title="Synchronicity Pilot Backend", version="0.1.0")
@@ -73,6 +75,8 @@ def start_session(req: StartSessionRequest) -> StartSessionResponse:
             num_heldout=req.num_heldout,
             dim=LATENT_DIM,
             fixed_order_ids=req.fixed_order_ids,
+            llm_api_key=ANTHROPIC_API_KEY or None,
+            llm_model=LLM_MODEL or None,
         )
         return StartSessionResponse(session_id=session_id, first_question=QuestionModel(**first_q.__dict__))
     except Exception as e:

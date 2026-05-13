@@ -7,7 +7,80 @@ Swap in any client that implements ``LLMClient`` (``complete(prompt) -> str``).
 from __future__ import annotations
 
 import re
-from typing import List, Protocol, runtime_checkable
+from typing import List, Protocol, Tuple, runtime_checkable
+
+import numpy as np
+
+# ---------------------------------------------------------------------------
+# Model default — override with LLM_MODEL env var.
+# Haiku is fast and cheap; sufficient for short question generation tasks.
+# ---------------------------------------------------------------------------
+DEFAULT_LLM_MODEL = "claude-haiku-4-5-20251001"
+
+# ---------------------------------------------------------------------------
+# Safety / quality gate
+# ---------------------------------------------------------------------------
+_SENSITIVE_TERMS: frozenset = frozenset(
+    {
+        "suicide",
+        "self-harm",
+        "self harm",
+        "abuse",
+        "trauma",
+        "religion",
+        "religious",
+        "race",
+        "racial",
+        "ethnic",
+        "sexual",
+        "sexuality",
+        "diagnosis",
+        "diagnose",
+        "politics",
+        "political",
+        "politician",
+    }
+)
+
+
+def validate_candidate_question(q: dict) -> Tuple[bool, str]:
+    """
+    Return ``(True, "")`` if the candidate passes all quality and safety checks,
+    or ``(False, reason)`` on the first failing check.
+
+    Rules (all must pass):
+    - text length between 10 and 220 characters (inclusive)
+    - text ends with a question mark
+    - text does not contain any sensitive / unsafe terms
+    - ``w`` key is present, non-empty, and not all zeros
+    """
+    text = str(q.get("text") or "").strip()
+
+    if len(text) < 10:
+        return False, "text too short (< 10 chars)"
+    if len(text) > 220:
+        return False, "text too long (> 220 chars)"
+    if not text.endswith("?"):
+        return False, "text does not end with a question mark"
+
+    text_lower = text.lower()
+    for term in _SENSITIVE_TERMS:
+        if term in text_lower:
+            return False, f"contains sensitive term: '{term}'"
+
+    w = q.get("w")
+    if w is None:
+        return False, "missing loading vector 'w'"
+    try:
+        w_arr = np.asarray(w, dtype=np.float64).reshape(-1)
+    except Exception:
+        return False, "loading vector 'w' could not be converted to array"
+    if w_arr.size == 0:
+        return False, "loading vector 'w' is empty"
+    if np.all(w_arr == 0.0):
+        return False, "loading vector 'w' is all zeros"
+
+    return True, ""
 
 
 @runtime_checkable
@@ -21,11 +94,11 @@ class LLMClient(Protocol):
 
 def build_generation_prompt(seed_questions: List[dict], n_candidates: int) -> str:
     """
-    Build a prompt that asks for new first-person Likert-style statements.
+    Build a prompt that asks for new personality-assessment questions.
 
     Args:
         seed_questions: Each dict should have at least a ``"text"`` key (question wording).
-        n_candidates: How many new statements to generate.
+        n_candidates: How many new questions to generate.
     """
     seed_lines = []
     for i, q in enumerate(seed_questions, start=1):
@@ -36,12 +109,14 @@ def build_generation_prompt(seed_questions: List[dict], n_candidates: int) -> st
 
     return f"""You are helping design a short personality questionnaire.
 
-Generate exactly {n_candidates} new candidate items. Each item must be:
+Generate exactly {n_candidates} new candidate questions. Each question must be:
 
-- A single first-person statement suitable for a Likert scale (e.g. Strongly disagree … Strongly agree)
-- One idea per statement only (no double-barreled questions; do not combine two unrelated claims with "and" or "or" in one item)
+- A single direct question suitable for a Likert scale (e.g. Strongly disagree … Strongly agree)
+- End with a question mark
+- One idea per question only (no double-barreled questions; do not combine two unrelated claims with "and" or "or")
 - Simple, natural, everyday wording
 - Clearly different in meaning from every seed question below (no paraphrases or near-duplicates of the seeds)
+- Must not mention sensitive topics such as suicide, self-harm, abuse, trauma, religion, race, sexual content, medical diagnosis, or politics
 
 Seed questions (do not repeat or closely mimic these):
 {seeds_block}
@@ -106,23 +181,71 @@ def generate_candidate_questions(
 
 class DummyLLMClient:
     """
-    Test double: returns a fixed numbered list of plausible Likert-style questions.
+    Test double: returns a fixed numbered list of plausible personality questions.
+    Used as a fallback when no API key is configured.
     """
 
-    _HARDCODED = """1. I like to spend time alone to recharge.
-2. I often notice small changes in my environment.
-3. I stay calm when plans change at the last minute.
-4. I enjoy learning skills that are completely new to me.
-5. I find it easy to empathize with someone I disagree with.
-6. I prefer clear instructions over figuring things out on my own.
-7. I sometimes put off tasks even when I know I should start them.
-8. I feel comfortable speaking up in a group discussion.
-9. I value fairness even when it slows a decision down.
-10. I tend to reflect on my day before going to sleep."""
+    _HARDCODED = """1. Do you like to spend time alone to recharge?
+2. Do you often notice small changes in your environment?
+3. Do you stay calm when plans change at the last minute?
+4. Do you enjoy learning skills that are completely new to you?
+5. Do you find it easy to empathize with someone you disagree with?
+6. Do you prefer clear instructions over figuring things out on your own?
+7. Do you sometimes put off tasks even when you know you should start them?
+8. Do you feel comfortable speaking up in a group discussion?
+9. Do you value fairness even when it slows a decision down?
+10. Do you tend to reflect on your day before going to sleep?"""
 
     def complete(self, prompt: str) -> str:
         _ = prompt  # API-compatible; dummy ignores prompt
         return self._HARDCODED
+
+
+class AnthropicLLMClient:
+    """
+    Production LLM client backed by the Anthropic Messages API.
+
+    Requires the ``anthropic`` package (``pip install anthropic``) and a valid
+    ``api_key``.  The model is configurable; defaults to ``DEFAULT_LLM_MODEL``
+    which can be overridden via the ``LLM_MODEL`` environment variable.
+    """
+
+    def __init__(self, api_key: str, model: str = DEFAULT_LLM_MODEL) -> None:
+        try:
+            import anthropic as _anthropic  # local import keeps dependency optional
+        except ImportError as exc:
+            raise ImportError(
+                "The 'anthropic' package is required for AnthropicLLMClient. "
+                "Install it with: pip install anthropic"
+            ) from exc
+        self._client = _anthropic.Anthropic(api_key=api_key)
+        self._model = model
+
+    def complete(self, prompt: str) -> str:
+        msg = self._client.messages.create(
+            model=self._model,
+            max_tokens=1024,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return msg.content[0].text
+
+
+def make_llm_client(
+    api_key: str | None = None,
+    model: str | None = None,
+) -> LLMClient:
+    """
+    Return an ``AnthropicLLMClient`` when *api_key* is provided, otherwise a
+    ``DummyLLMClient`` (no network calls, deterministic output).
+
+    Args:
+        api_key: Anthropic API key. If ``None`` or empty, falls back to dummy.
+        model:   Model ID to pass to ``AnthropicLLMClient``. Defaults to
+                 ``DEFAULT_LLM_MODEL`` (``claude-haiku-4-5-20251001``).
+    """
+    if api_key:
+        return AnthropicLLMClient(api_key=api_key, model=model or DEFAULT_LLM_MODEL)
+    return DummyLLMClient()
 
 
 if __name__ == "__main__":

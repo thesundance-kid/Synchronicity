@@ -9,7 +9,7 @@ from typing import List, Optional, Sequence
 import numpy as np
 
 from models.question_assignment import assign_w_to_candidates, cosine_similarity_matrix, embed_texts
-from models.question_generation import generate_candidate_questions
+from models.question_generation import generate_candidate_questions, validate_candidate_question
 
 # Cosine similarity above this vs. a seed or another kept candidate counts as a near-duplicate.
 _SIM_THRESHOLD = 0.9
@@ -151,7 +151,21 @@ def build_generated_pool(
         return []
 
     assigned = assign_w_to_candidates(candidates, seed_items, k=k)
-    return [_normalize_question_dict(row) for row in assigned]
+
+    # Safety / quality gate: drop any candidate that fails text or loading-vector checks.
+    valid = []
+    for row in assigned:
+        ok, reason = validate_candidate_question(row)
+        if ok:
+            valid.append(row)
+        else:
+            import warnings
+            warnings.warn(
+                f"Generated question rejected ({reason}): {str(row.get('text', ''))[:80]}",
+                stacklevel=2,
+            )
+
+    return [_normalize_question_dict(row) for row in valid]
 
 
 def build_session_inference_pool(
