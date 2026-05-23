@@ -25,17 +25,17 @@ Long-term direction: adaptive cognitive assessment, delirium-related research, a
 | `models/personality_state.py` | Gaussian belief `N(μ, Σ)` over 5 traits. Laplace posterior updates via BFGS + finite-difference Hessian. Entropy and predictive Likert probabilities. |
 | `models/question_selection.py` | `expected_information_gain()` and `select_next_question_eig()`. Greedy EIG maximization over candidate pool. |
 
-**Posterior update:** `personality_state.py:165` — `update_posterior_likert_laplace()`, called from `session_manager.py:398`.
+**Posterior update:** `personality_state.py:165` — `update_posterior_likert_laplace()`, called from `session_manager.py`.
 
-**EIG selection:** `question_selection.py:97` — `select_next_question_eig()`, called from `session_manager.py:306`.
+**EIG selection:** `question_selection.py:97` — `select_next_question_eig()`, called from `session_manager.py`.
 
 ### Session layer
 
 | File | Responsibility |
 |---|---|
-| `app/session_manager.py` | Full session lifecycle: creation, EIG-driven question selection, answer recording, posterior serialization, heldout evaluation, run logging. |
-| `app/db.py` | SQLite schema and persistence. Tables: `sessions`, `responses`, `session_step_logs`, `session_run_logs`. |
-| `app/main.py` | FastAPI endpoints (`/start_session`, `/next_question`, `/answer`, `/session_summary`) and env var reads. |
+| `app/session_manager.py` | Full session lifecycle: creation, EIG-driven question selection, answer recording, posterior serialization, heldout evaluation, run logging, warm-start from prior posteriors. |
+| `app/db.py` | SQLite schema and persistence. Tables: `sessions`, `responses`, `session_step_logs`, `session_run_logs`, `users`, `user_current_state`, `user_posteriors`, `posterior_snapshots`, `question_performance_events`. |
+| `app/main.py` | FastAPI endpoints (`/start_session`, `/next_question`, `/answer`, `/session_summary`, `/register_user`, `/user/{user_id}`, `/user/{user_id}/posterior`, `/session/{session_id}/posterior_history`) and env var reads. |
 
 ### Question data and generation
 
@@ -104,32 +104,92 @@ make_llm_client() → generate_candidate_questions() → _dedupe_generated_candi
 
 ---
 
-## Current status (as of 2026-05-13)
+## Database schema
+
+### Existing tables
+| Table | Purpose |
+|---|---|
+| `sessions` | Full session state: posterior μ/Σ, asked/heldout IDs, inference pool, arm, pending question. Now also carries `user_id` (nullable FK) and `prior_session_id` (nullable). |
+| `responses` | One row per answered question (inference or heldout). |
+| `session_step_logs` | Per-step telemetry: EIG at selection, entropy before/after, source. |
+| `session_run_logs` | Per-session aggregate: arm, generated candidate counts, heldout metrics. |
+
+### Phase 1 tables (anonymous users + longitudinal state)
+| Table | Purpose |
+|---|---|
+| `users` | Anonymous user registry. `user_id = secrets.token_urlsafe(16)`. No auth beyond possessing the token. |
+| `user_current_state` | One row per user (upserted after every inference answer). The warm-start source. Used even for abandoned sessions. |
+| `user_posteriors` | Append-only completed-session history. Written only when status reaches `complete`. One row per (user, completed session). |
+| `posterior_snapshots` | Per-step posterior snapshots within a session. `step_idx=0` = initial prior or warm-start. One row per inference answer. |
+
+### Phase 2 tables (question learning signal)
+| Table | Purpose |
+|---|---|
+| `question_performance_events` | One row per inference answer. Stores full before/after posterior state (μ, Σ), predicted EIG, realized information gain, response value, question source, and `user_id`. Heldout answers are excluded. `parameter_version` is NULL until Phase 4. |
+
+---
+
+## Session flow (key paths)
+
+**Session creation** (`session_manager.create_session`):
+1. If `user_id` provided → look up `user_current_state` → warm-start `PersonalityState` from prior μ/Σ; otherwise flat prior N(0, I).
+2. Build inference pool (seed-only or seed+generated per arm assignment).
+3. Insert session row with `user_id` and `prior_session_id`.
+4. Insert `posterior_snapshots` at `step_idx=0`.
+
+**Inference answer** (`session_manager.record_answer`, inference pool only):
+1. Bayesian posterior update via `update_posterior_likert_laplace()` (unchanged).
+2. Persist updated posterior to `sessions` table (unchanged).
+3. Insert `posterior_snapshots` at `step_idx=N`.
+4. Upsert `user_current_state` (if session has `user_id`).
+5. Insert `question_performance_events` row.
+
+**Session completion** (`_finalize_heldout_evaluation_if_needed`):
+1. Compute heldout metrics (unchanged).
+2. Insert `session_run_logs` (unchanged).
+3. Insert `user_posteriors` row (if session has `user_id`).
+
+---
+
+## Current status (as of 2026-05-23)
 
 - Bayesian/EIG inference loop: complete and benchmarked
 - Live LLM question generation: implemented (`AnthropicLLMClient` + validation)
 - A/B experiment arm logic: implemented (`seed_only` vs `seed_plus_generated`)
 - Held-out evaluation and per-step telemetry: implemented
-- Smoke tests passing: `test_v2_lite_session.py`, `test_real_session_backend.py`
+- **Phase 1 complete:** anonymous users, longitudinal state, warm-start, posterior snapshots
+- **Phase 2 complete:** `question_performance_events` — full before/after posterior per inference answer
 - Frontend: not yet built
 
 ---
 
 ## Near-term roadmap
 
-1. **Minimal frontend** — session UI that drives the `/start_session` → `/answer` loop
-2. **Uncertainty visualization** — display trait posterior (μ ± σ) as the session progresses
-3. **Final profile page** — probabilistic Big Five summary at session end
-4. **Longitudinal sessions** — warm-start posterior from a prior session
-5. **Adaptive cognitive inference** — extend latent-state framework beyond personality (delirium, cognitive load, etc.)
+1. **Phase 3** — generated-question candidate metadata (rejected candidates, dedupe scores, nn_seed_ids)
+2. **Phase 4** — `question_parameter_versions` table; versioned w/noise_var/thresholds
+3. **Phase 5** — admin/query endpoints (question stats, generated question analytics)
+4. **Minimal frontend** — session UI that drives the `/start_session` → `/answer` loop
+5. **Uncertainty visualization** — display trait posterior (μ ± σ) as the session progresses
+6. **Final profile page** — probabilistic Big Five summary at session end
+7. **Adaptive cognitive inference** — extend latent-state framework beyond personality (delirium, cognitive load, etc.)
 
 ---
 
 ## Smoke tests
 
 ```bash
-python scripts/test_v2_lite_session.py           # generation + EIG loop (no API key needed)
+# Core inference (no API key needed)
+python scripts/test_v2_lite_session.py           # generation + EIG loop
 python scripts/test_real_session_backend.py      # full session lifecycle
+python scripts/test_eig_after_update.py          # EIG scores after posterior update
 python scripts/compare_policies.py               # EIG vs random vs fixed-order benchmark
-ANTHROPIC_API_KEY=sk-ant-... python scripts/test_v2_lite_session.py  # live generation path
+
+# Phase 1: users and longitudinal state
+python scripts/test_phase1_users.py              # registration, warm-start, snapshots (29 assertions)
+
+# Phase 2: question performance events
+python scripts/test_phase2_performance_events.py # per-answer event logging (58 assertions)
+
+# Live generation path
+ANTHROPIC_API_KEY=sk-ant-... python scripts/test_v2_lite_session.py
 ```
