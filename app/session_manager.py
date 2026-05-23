@@ -157,6 +157,20 @@ def _finalize_heldout_evaluation_if_needed(
         generated_usage=usage,
     )
 
+    # Phase 1: persist completed-session posterior to user longitudinal history.
+    if sess.user_id is not None:
+        session_number = db.count_user_posteriors(conn, sess.user_id) + 1
+        final_state = _state_from_jsonable(sess.posterior_mu, sess.posterior_sigma)
+        db.insert_user_posterior(
+            conn,
+            user_id=sess.user_id,
+            session_id=session_id,
+            session_number=session_number,
+            mu=sess.posterior_mu,
+            sigma=sess.posterior_sigma,
+            entropy=float(final_state.entropy()),
+        )
+
 
 def load_bank(
     questions_v2_path: str,
@@ -186,6 +200,7 @@ def create_session(
     llm_model: Optional[str] = None,
     n_generation_candidates: int = 10,
     nn_k: int = 3,
+    user_id: Optional[str] = None,
 ) -> Tuple[str, QuestionPayload]:
     """
     Create a new session and return (session_id, first_question_payload).
@@ -257,8 +272,20 @@ def create_session(
     rng.shuffle(heldout_ids)
     heldout_ids = heldout_ids[:num_heldout]
 
-    state = PersonalityState(dim=dim)
+    # Phase 1: warm-start from user_current_state if available; otherwise flat prior.
+    prior_session_id: Optional[str] = None
+    if user_id is not None:
+        warm = db.get_user_current_state(conn, user_id)
+        if warm is not None:
+            state = _state_from_jsonable(warm["mu"], warm["sigma"])
+            prior_session_id = warm["latest_session_id"]
+        else:
+            state = PersonalityState(dim=dim)
+    else:
+        state = PersonalityState(dim=dim)
+
     mu, sigma = _state_to_jsonable(state)
+    initial_entropy = float(state.entropy())
 
     n_gen = len(generated_stored) if generated_stored else 0
     gen_qids = [str(d["id"]) for d in generated_stored] if generated_stored else []
@@ -280,6 +307,18 @@ def create_session(
         inference_pool=final_inference_dicts,
         n_generated_candidates=n_gen,
         generated_question_ids=gen_qids,
+        user_id=user_id,
+        prior_session_id=prior_session_id,
+    )
+
+    # Phase 1: record the initial prior (or warm-start) as step 0 snapshot.
+    db.insert_posterior_snapshot(
+        conn,
+        session_id=session_id,
+        step_idx=0,
+        mu=mu,
+        sigma=sigma,
+        entropy=initial_entropy,
     )
 
     q = get_next_question(conn, questions_v2_path=questions_v2_path, session_id=session_id, dim=dim)
@@ -439,6 +478,47 @@ def record_answer(
             asked_ids=asked_ids,
             posterior_mu=mu,
             posterior_sigma=sigma,
+        )
+
+        # Phase 1: per-step snapshot and longitudinal user state.
+        db.insert_posterior_snapshot(
+            conn,
+            session_id=session_id,
+            step_idx=next_step,
+            mu=mu,
+            sigma=sigma,
+            entropy=entropy_after,
+        )
+        if sess.user_id is not None:
+            db.upsert_user_current_state(
+                conn,
+                user_id=sess.user_id,
+                latest_session_id=session_id,
+                latest_step_idx=next_step,
+                mu=mu,
+                sigma=sigma,
+                entropy=entropy_after,
+            )
+
+        # Phase 2: record per-answer learning signal (inference only).
+        # sess.posterior_mu/sigma are the frozen pre-update values from the SessionRow.
+        db.insert_question_performance_event(
+            conn,
+            question_id=question_id,
+            session_id=session_id,
+            user_id=sess.user_id,
+            step_idx=step_idx,
+            question_source=src,
+            parameter_version=None,
+            predicted_eig=eig_at,
+            entropy_before=entropy_before,
+            entropy_after=entropy_after,
+            realized_information_gain=entropy_before - entropy_after,
+            response_value=int(response),
+            mu_before=sess.posterior_mu,
+            sigma_before=sess.posterior_sigma,
+            mu_after=mu,
+            sigma_after=sigma,
         )
     else:
         entropy_after = entropy_before
