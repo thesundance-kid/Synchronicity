@@ -11,6 +11,7 @@ Endpoints:
 from __future__ import annotations
 
 import os
+import secrets
 import sqlite3
 from typing import Optional
 
@@ -48,6 +49,7 @@ class StartSessionRequest(BaseModel):
     max_inference_questions: int = Field(5, ge=1, le=50)
     num_heldout: int = Field(5, ge=1, le=50)
     fixed_order_ids: Optional[list[str]] = None
+    user_id: Optional[str] = None
 
 
 class QuestionModel(BaseModel):
@@ -77,6 +79,7 @@ def start_session(req: StartSessionRequest) -> StartSessionResponse:
             fixed_order_ids=req.fixed_order_ids,
             llm_api_key=ANTHROPIC_API_KEY or None,
             llm_model=LLM_MODEL or None,
+            user_id=req.user_id or None,
         )
         return StartSessionResponse(session_id=session_id, first_question=QuestionModel(**first_q.__dict__))
     except Exception as e:
@@ -138,6 +141,71 @@ def session_summary(session_id: str):
     db.init_db(conn)
     try:
         return get_session_summary(conn, questions_v2_path=QUESTIONS_PATH, session_id=session_id, dim=LATENT_DIM)
+    except KeyError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Phase 1: user registration and longitudinal endpoints
+# ---------------------------------------------------------------------------
+
+@app.post("/register_user")
+def register_user():
+    user_id = secrets.token_urlsafe(16)
+    conn = db.connect(DB_PATH)
+    db.init_db(conn)
+    try:
+        db.insert_user(conn, user_id=user_id)
+        return {"user_id": user_id}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    finally:
+        conn.close()
+
+
+@app.get("/user/{user_id}")
+def get_user(user_id: str):
+    conn = db.connect(DB_PATH)
+    db.init_db(conn)
+    try:
+        user = db.get_user(conn, user_id)
+        if user is None:
+            raise HTTPException(status_code=404, detail="User not found")
+        sessions = db.list_sessions_for_user(conn, user_id)
+        return {"user_id": user_id, "created_at": user["created_at"], "sessions": sessions}
+    finally:
+        conn.close()
+
+
+@app.get("/user/{user_id}/posterior")
+def get_user_posterior(user_id: str):
+    conn = db.connect(DB_PATH)
+    db.init_db(conn)
+    try:
+        user = db.get_user(conn, user_id)
+        if user is None:
+            raise HTTPException(status_code=404, detail="User not found")
+        row = db.get_latest_user_posterior(conn, user_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="No completed sessions for this user")
+        return row
+    finally:
+        conn.close()
+
+
+@app.get("/session/{session_id}/posterior_history")
+def get_posterior_history(session_id: str):
+    conn = db.connect(DB_PATH)
+    db.init_db(conn)
+    try:
+        # Verify session exists before fetching snapshots.
+        db.get_session(conn, session_id)
+        snapshots = db.list_posterior_snapshots(conn, session_id)
+        return {"session_id": session_id, "snapshots": snapshots}
     except KeyError as e:
         raise HTTPException(status_code=404, detail=str(e)) from e
     except Exception as e:
