@@ -64,12 +64,13 @@ def main() -> None:
     print("=== V2-lite debug session ===\n")
     print(f"Loaded {len(inference_seed)} seed inference questions from {questions_path.name}")
 
-    generated = build_generated_pool(
+    gen_result = build_generated_pool(
         DummyLLMClient(),
         seeds_for_gen,
         n_candidates=8,
         k=3,
     )
+    generated = gen_result.accepted
     print(f"After dedupe + assign_w: {len(generated)} generated items")
 
     generated_ids = {d["id"] for d in generated}

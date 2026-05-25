@@ -125,7 +125,17 @@ make_llm_client() → generate_candidate_questions() → _dedupe_generated_candi
 ### Phase 2 tables (question learning signal)
 | Table | Purpose |
 |---|---|
-| `question_performance_events` | One row per inference answer. Stores full before/after posterior state (μ, Σ), predicted EIG, realized information gain, response value, question source, and `user_id`. Heldout answers are excluded. `parameter_version` is NULL until Phase 4. |
+| `question_performance_events` | One row per inference answer. Stores full before/after posterior state (μ, Σ), predicted EIG, realized information gain, response value, question source, and `user_id`. Heldout answers are excluded. `parameter_version` is populated from the active `question_parameter_versions` row (NULL for generated questions with no version). |
+
+### Phase 3 tables (generated candidate metadata)
+| Table | Purpose |
+|---|---|
+| `generated_question_candidates` | One row per raw LLM candidate per session (accepted and rejected). Fields: `session_id`, `candidate_index`, `text`, `question_id` (NULL if rejected), `max_seed_similarity`, `max_kept_similarity`, `dedupe_failed`, `validation_passed`, `validation_failure_reason`, `accepted_into_pool`, `w_json`, `noise_var`, `thresholds_json`, `nn_seed_ids_json`, `nn_similarities_json`, `selected_at_step` (set when the question is actually answered). |
+
+### Phase 4 tables (versioned question parameters)
+| Table | Purpose |
+|---|---|
+| `question_parameter_versions` | Versioned measurement parameters per question. Fields: `question_id`, `version` (auto-incremented per question), `w_json`, `noise_var`, `thresholds_json`, `source` (`'seed'` or `'estimated'`), `estimation_method`, `n_responses_used`, `performance_summary_json`, `active` (only one active per question at a time), `created_at`. UNIQUE(question_id, version). Seeded at startup via `db.seed_question_parameters()` — idempotent. |
 
 ---
 
@@ -142,7 +152,9 @@ make_llm_client() → generate_candidate_questions() → _dedupe_generated_candi
 2. Persist updated posterior to `sessions` table (unchanged).
 3. Insert `posterior_snapshots` at `step_idx=N`.
 4. Upsert `user_current_state` (if session has `user_id`).
-5. Insert `question_performance_events` row.
+5. Look up `get_active_question_parameter_version()` → populate `parameter_version`.
+6. Insert `question_performance_events` row with resolved `parameter_version`.
+7. Update `generated_question_candidates.selected_at_step` if question is generated.
 
 **Session completion** (`_finalize_heldout_evaluation_if_needed`):
 1. Compute heldout metrics (unchanged).
@@ -151,7 +163,7 @@ make_llm_client() → generate_candidate_questions() → _dedupe_generated_candi
 
 ---
 
-## Current status (as of 2026-05-23)
+## Current status (as of 2026-05-25)
 
 - Bayesian/EIG inference loop: complete and benchmarked
 - Live LLM question generation: implemented (`AnthropicLLMClient` + validation)
@@ -159,14 +171,16 @@ make_llm_client() → generate_candidate_questions() → _dedupe_generated_candi
 - Held-out evaluation and per-step telemetry: implemented
 - **Phase 1 complete:** anonymous users, longitudinal state, warm-start, posterior snapshots
 - **Phase 2 complete:** `question_performance_events` — full before/after posterior per inference answer
+- **Phase 3 complete:** `generated_question_candidates` — all raw LLM candidates logged per session (accepted + rejected), with dedupe scores, validation reasons, nn_seed_ids, nn_similarities, and `selected_at_step` filled when EIG picks a generated question
+- **Phase 4 complete:** `question_parameter_versions` — versioned w/noise_var/thresholds; seeded at startup via `db.seed_question_parameters()`; `parameter_version` populated in performance events
 - Frontend: not yet built
 
 ---
 
 ## Near-term roadmap
 
-1. **Phase 3** — generated-question candidate metadata (rejected candidates, dedupe scores, nn_seed_ids)
-2. **Phase 4** — `question_parameter_versions` table; versioned w/noise_var/thresholds
+1. ~~**Phase 3**~~ — complete
+2. ~~**Phase 4**~~ — complete
 3. **Phase 5** — admin/query endpoints (question stats, generated question analytics)
 4. **Minimal frontend** — session UI that drives the `/start_session` → `/answer` loop
 5. **Uncertainty visualization** — display trait posterior (μ ± σ) as the session progresses
@@ -189,6 +203,12 @@ python scripts/test_phase1_users.py              # registration, warm-start, sna
 
 # Phase 2: question performance events
 python scripts/test_phase2_performance_events.py # per-answer event logging (58 assertions)
+
+# Phase 3: generated candidate metadata
+python scripts/test_phase3_generated_candidates.py  # candidate logging, rejection tracking, selected_at_step (42 assertions)
+
+# Phase 4: versioned question parameters
+python scripts/test_phase4_question_parameter_versions.py  # seeding, versioning, record_answer integration (38 assertions)
 
 # Live generation path
 ANTHROPIC_API_KEY=sk-ant-... python scripts/test_v2_lite_session.py

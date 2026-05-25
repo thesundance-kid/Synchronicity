@@ -234,19 +234,21 @@ def create_session(
 
     use_generated = should_use_generated_questions(arm)
     generated_stored: Optional[List[Dict[str, Any]]] = None
+    generated_candidates_metadata: Optional[List[Dict[str, Any]]] = None
     if use_generated:
         if llm_client is not None:
             client = llm_client
         else:
             client = make_llm_client(api_key=llm_api_key, model=llm_model)
         try:
-            gen_list = build_generated_pool(
+            gen_result = build_generated_pool(
                 client,
                 seeds_for_generation,
                 n_candidates=n_generation_candidates,
                 k=nn_k,
             )
-            generated_stored = [_jsonable_question_dict(x) for x in gen_list]
+            generated_stored = [_jsonable_question_dict(x) for x in gen_result.accepted]
+            generated_candidates_metadata = gen_result.all_candidates_metadata
         except Exception as exc:  # noqa: BLE001
             import warnings
             warnings.warn(
@@ -254,6 +256,7 @@ def create_session(
                 stacklevel=2,
             )
             generated_stored = None
+            generated_candidates_metadata = None
 
     final_inference_dicts = build_session_inference_pool(seed_stored, generated_stored if use_generated else None)
     inference_ids = {d["id"] for d in final_inference_dicts}
@@ -320,6 +323,32 @@ def create_session(
         sigma=sigma,
         entropy=initial_entropy,
     )
+
+    # Phase 3: persist generated candidate metadata (all raw LLM candidates, including rejected).
+    if generated_candidates_metadata is not None:
+        for meta in generated_candidates_metadata:
+            try:
+                db.insert_generated_question_candidate(
+                    conn,
+                    session_id=session_id,
+                    candidate_index=int(meta["candidate_index"]),
+                    text=str(meta["text"]),
+                    question_id=meta.get("question_id"),
+                    max_seed_similarity=meta.get("max_seed_similarity"),
+                    max_kept_similarity=meta.get("max_kept_similarity"),
+                    dedupe_failed=bool(meta.get("dedupe_failed", False)),
+                    validation_passed=bool(meta.get("validation_passed", False)),
+                    validation_failure_reason=meta.get("validation_failure_reason"),
+                    accepted_into_pool=bool(meta.get("accepted_into_pool", False)),
+                    w=meta.get("w"),
+                    noise_var=meta.get("noise_var"),
+                    thresholds=meta.get("thresholds"),
+                    nn_seed_ids=meta.get("nn_seed_ids"),
+                    nn_similarities=meta.get("nn_similarities"),
+                )
+            except Exception as exc:  # noqa: BLE001
+                import warnings
+                warnings.warn(f"Failed to persist generated question metadata: {exc}", stacklevel=2)
 
     q = get_next_question(conn, questions_v2_path=questions_v2_path, session_id=session_id, dim=dim)
     if q is None:
@@ -502,6 +531,9 @@ def record_answer(
 
         # Phase 2: record per-answer learning signal (inference only).
         # sess.posterior_mu/sigma are the frozen pre-update values from the SessionRow.
+        # Phase 4: look up the active parameter version for this question (None for generated).
+        _pv = db.get_active_question_parameter_version(conn, question_id)
+        parameter_version = _pv["version"] if _pv is not None else None
         db.insert_question_performance_event(
             conn,
             question_id=question_id,
@@ -509,7 +541,7 @@ def record_answer(
             user_id=sess.user_id,
             step_idx=step_idx,
             question_source=src,
-            parameter_version=None,
+            parameter_version=parameter_version,
             predicted_eig=eig_at,
             entropy_before=entropy_before,
             entropy_after=entropy_after,
@@ -520,6 +552,19 @@ def record_answer(
             mu_after=mu,
             sigma_after=sigma,
         )
+
+        # Phase 3: mark generated question as selected at this step.
+        if src == "generated":
+            try:
+                db.update_generated_candidate_selected_at_step(
+                    conn,
+                    session_id=session_id,
+                    question_id=question_id,
+                    selected_at_step=step_idx,
+                )
+            except Exception as exc:  # noqa: BLE001
+                import warnings
+                warnings.warn(f"Failed to update generated candidate selected_at_step: {exc}", stacklevel=2)
     else:
         entropy_after = entropy_before
 

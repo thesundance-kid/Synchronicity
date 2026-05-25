@@ -151,7 +151,7 @@ def assign_w_to_candidates(
     Embed all seed texts once, then assign ``w`` to each candidate by nearest neighbors.
 
     Each output item includes ``"id"`` (``gen_<index>``), ``"w"``, ``"source": "generated"``,
-    plus original candidate keys (e.g. ``"text"``).
+    ``"nn_seed_ids"``, ``"nn_similarities"``, plus original candidate keys (e.g. ``"text"``).
     """
     seed_texts = [str(s.get("text", "")) for s in seed_items]
     seed_embeddings = embed_texts(seed_texts)
@@ -169,5 +169,7 @@ def assign_w_to_candidates(
         row["id"] = f"gen_{idx}"
         row["w"] = assignment["w"]
         row["source"] = "generated"
+        row["nn_seed_ids"] = assignment["nn_seed_ids"]
+        row["nn_similarities"] = assignment["nn_similarities"]
         out.append(row)
     return out

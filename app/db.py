@@ -281,6 +281,58 @@ def init_db(conn: sqlite3.Connection) -> None:
         );
         """
     )
+
+    # Phase 4: versioned question measurement parameters (w, noise_var, thresholds).
+    # Each row is one immutable snapshot of a question's parameters at a point in time.
+    # Only one row per question_id may be active=1 at a time.
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS question_parameter_versions (
+          id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+          question_id             TEXT    NOT NULL,
+          version                 INTEGER NOT NULL,
+          w_json                  TEXT    NOT NULL,
+          noise_var               REAL    NOT NULL,
+          thresholds_json         TEXT    NOT NULL,
+          source                  TEXT    NOT NULL DEFAULT 'seed',
+          estimation_method       TEXT,
+          n_responses_used        INTEGER,
+          performance_summary_json TEXT,
+          active                  INTEGER NOT NULL DEFAULT 1,
+          created_at              INTEGER NOT NULL,
+          UNIQUE(question_id, version)
+        );
+        """
+    )
+
+    # Phase 3: per-session metadata for every raw LLM-generated candidate question.
+    # Stores accepted and rejected candidates so generation quality can be analyzed later.
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS generated_question_candidates (
+          id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+          session_id              TEXT    NOT NULL,
+          candidate_index         INTEGER NOT NULL,
+          text                    TEXT    NOT NULL,
+          question_id             TEXT,
+          max_seed_similarity     REAL,
+          max_kept_similarity     REAL,
+          dedupe_failed           INTEGER NOT NULL DEFAULT 0,
+          validation_passed       INTEGER NOT NULL DEFAULT 0,
+          validation_failure_reason TEXT,
+          accepted_into_pool      INTEGER NOT NULL DEFAULT 0,
+          w_json                  TEXT,
+          noise_var               REAL,
+          thresholds_json         TEXT,
+          nn_seed_ids_json        TEXT,
+          nn_similarities_json    TEXT,
+          selected_at_step        INTEGER,
+          created_at              INTEGER NOT NULL,
+          UNIQUE(session_id, candidate_index),
+          FOREIGN KEY(session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
+        );
+        """
+    )
     conn.commit()
 
 
@@ -971,4 +1023,283 @@ def list_question_performance_events_for_question(
         (question_id,),
     ).fetchall()
     return [_qpe_row_to_dict(r) for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# Phase 3: generated_question_candidates
+# ---------------------------------------------------------------------------
+
+def insert_generated_question_candidate(
+    conn: sqlite3.Connection,
+    *,
+    session_id: str,
+    candidate_index: int,
+    text: str,
+    question_id: Optional[str],
+    max_seed_similarity: Optional[float],
+    max_kept_similarity: Optional[float],
+    dedupe_failed: bool,
+    validation_passed: bool,
+    validation_failure_reason: Optional[str],
+    accepted_into_pool: bool,
+    w: Optional[Sequence[float]],
+    noise_var: Optional[float],
+    thresholds: Optional[Sequence[float]],
+    nn_seed_ids: Optional[Sequence[Any]],
+    nn_similarities: Optional[Sequence[float]],
+) -> None:
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO generated_question_candidates (
+          session_id, candidate_index, text,
+          question_id, max_seed_similarity, max_kept_similarity,
+          dedupe_failed, validation_passed, validation_failure_reason,
+          accepted_into_pool,
+          w_json, noise_var, thresholds_json,
+          nn_seed_ids_json, nn_similarities_json,
+          selected_at_step, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+        """,
+        (
+            session_id,
+            int(candidate_index),
+            str(text),
+            question_id,
+            float(max_seed_similarity) if max_seed_similarity is not None else None,
+            float(max_kept_similarity) if max_kept_similarity is not None else None,
+            1 if dedupe_failed else 0,
+            1 if validation_passed else 0,
+            validation_failure_reason,
+            1 if accepted_into_pool else 0,
+            _dumps(list(w)) if w is not None else None,
+            float(noise_var) if noise_var is not None else None,
+            _dumps(list(thresholds)) if thresholds is not None else None,
+            _dumps(list(nn_seed_ids)) if nn_seed_ids is not None else None,
+            _dumps(list(nn_similarities)) if nn_similarities is not None else None,
+            None,  # selected_at_step starts NULL
+            _utc_ts(),
+        ),
+    )
+    conn.commit()
+
+
+def update_generated_candidate_selected_at_step(
+    conn: sqlite3.Connection,
+    *,
+    session_id: str,
+    question_id: str,
+    selected_at_step: int,
+) -> None:
+    conn.execute(
+        """
+        UPDATE generated_question_candidates
+        SET selected_at_step = ?
+        WHERE session_id = ? AND question_id = ?;
+        """,
+        (int(selected_at_step), session_id, question_id),
+    )
+    conn.commit()
+
+
+def list_generated_question_candidates(
+    conn: sqlite3.Connection, session_id: str
+) -> List[Dict[str, Any]]:
+    rows = conn.execute(
+        """
+        SELECT id, session_id, candidate_index, text,
+               question_id, max_seed_similarity, max_kept_similarity,
+               dedupe_failed, validation_passed, validation_failure_reason,
+               accepted_into_pool,
+               w_json, noise_var, thresholds_json,
+               nn_seed_ids_json, nn_similarities_json,
+               selected_at_step, created_at
+        FROM generated_question_candidates
+        WHERE session_id = ?
+        ORDER BY candidate_index ASC, id ASC;
+        """,
+        (session_id,),
+    ).fetchall()
+    return [
+        {
+            "id": int(r["id"]),
+            "session_id": r["session_id"],
+            "candidate_index": int(r["candidate_index"]),
+            "text": r["text"],
+            "question_id": r["question_id"],
+            "max_seed_similarity": (
+                float(r["max_seed_similarity"]) if r["max_seed_similarity"] is not None else None
+            ),
+            "max_kept_similarity": (
+                float(r["max_kept_similarity"]) if r["max_kept_similarity"] is not None else None
+            ),
+            "dedupe_failed": bool(r["dedupe_failed"]),
+            "validation_passed": bool(r["validation_passed"]),
+            "validation_failure_reason": r["validation_failure_reason"],
+            "accepted_into_pool": bool(r["accepted_into_pool"]),
+            "w": _loads(r["w_json"], None),
+            "noise_var": float(r["noise_var"]) if r["noise_var"] is not None else None,
+            "thresholds": _loads(r["thresholds_json"], None),
+            "nn_seed_ids": _loads(r["nn_seed_ids_json"], None),
+            "nn_similarities": _loads(r["nn_similarities_json"], None),
+            "selected_at_step": (
+                int(r["selected_at_step"]) if r["selected_at_step"] is not None else None
+            ),
+            "created_at": int(r["created_at"]),
+        }
+        for r in rows
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Phase 4: question_parameter_versions
+# ---------------------------------------------------------------------------
+
+def _qpv_row_to_dict(r) -> Dict[str, Any]:
+    return {
+        "id": int(r["id"]),
+        "question_id": r["question_id"],
+        "version": int(r["version"]),
+        "w": _loads(r["w_json"], []),
+        "noise_var": float(r["noise_var"]),
+        "thresholds": _loads(r["thresholds_json"], []),
+        "source": r["source"],
+        "estimation_method": r["estimation_method"],
+        "n_responses_used": (
+            int(r["n_responses_used"]) if r["n_responses_used"] is not None else None
+        ),
+        "performance_summary": _loads(r["performance_summary_json"], None),
+        "active": bool(r["active"]),
+        "created_at": int(r["created_at"]),
+    }
+
+
+def insert_question_parameter_version(
+    conn: sqlite3.Connection,
+    *,
+    question_id: str,
+    w: Sequence[float],
+    noise_var: float,
+    thresholds: Sequence[float],
+    source: str = "seed",
+    estimation_method: Optional[str] = None,
+    n_responses_used: Optional[int] = None,
+    performance_summary: Optional[Dict[str, Any]] = None,
+    active: bool = True,
+) -> int:
+    """
+    Insert a new parameter version for *question_id* and return its version number.
+
+    Version is auto-incremented (max existing + 1, or 1 if none exist).
+    If *active* is True, all prior active versions for the same question_id are
+    set to active=0 in the same implicit transaction before the new row is inserted.
+    """
+    if active:
+        conn.execute(
+            "UPDATE question_parameter_versions SET active = 0 WHERE question_id = ? AND active = 1;",
+            (question_id,),
+        )
+
+    row = conn.execute(
+        "SELECT COALESCE(MAX(version), 0) FROM question_parameter_versions WHERE question_id = ?;",
+        (question_id,),
+    ).fetchone()
+    next_version = int(row[0]) + 1
+
+    conn.execute(
+        """
+        INSERT INTO question_parameter_versions (
+            question_id, version, w_json, noise_var, thresholds_json,
+            source, estimation_method, n_responses_used, performance_summary_json,
+            active, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+        """,
+        (
+            question_id,
+            next_version,
+            _dumps(list(w)),
+            float(noise_var),
+            _dumps(list(thresholds)),
+            str(source),
+            estimation_method,
+            int(n_responses_used) if n_responses_used is not None else None,
+            _dumps(performance_summary) if performance_summary is not None else None,
+            1 if active else 0,
+            _utc_ts(),
+        ),
+    )
+    conn.commit()
+    return next_version
+
+
+def get_active_question_parameter_version(
+    conn: sqlite3.Connection, question_id: str
+) -> Optional[Dict[str, Any]]:
+    """Return the single active parameter version for *question_id*, or None."""
+    row = conn.execute(
+        """
+        SELECT * FROM question_parameter_versions
+        WHERE question_id = ? AND active = 1
+        LIMIT 1;
+        """,
+        (question_id,),
+    ).fetchone()
+    return _qpv_row_to_dict(row) if row is not None else None
+
+
+def list_question_parameter_versions(
+    conn: sqlite3.Connection, question_id: str
+) -> List[Dict[str, Any]]:
+    """Return all parameter versions for *question_id* ordered by version ASC."""
+    rows = conn.execute(
+        """
+        SELECT * FROM question_parameter_versions
+        WHERE question_id = ?
+        ORDER BY version ASC;
+        """,
+        (question_id,),
+    ).fetchall()
+    return [_qpv_row_to_dict(r) for r in rows]
+
+
+def seed_question_parameters(conn: sqlite3.Connection, questions_v2_path: str) -> None:
+    """
+    Insert version 1 (source='seed') for every question in *questions_v2_path* that
+    has no parameter version recorded yet. Idempotent: questions that already have
+    at least one version are skipped unconditionally.
+    """
+    with open(questions_v2_path, "r", encoding="utf-8") as f:
+        raw = json.load(f)
+
+    if isinstance(raw, dict):
+        all_items: List[Dict[str, Any]] = []
+        all_items.extend(raw.get("inference_pool", []))
+        all_items.extend(raw.get("heldout_pool", []))
+    else:
+        all_items = list(raw)
+
+    for item in all_items:
+        qid = item.get("id")
+        w_raw = item.get("w")
+        if not qid or w_raw is None:
+            continue
+
+        existing = conn.execute(
+            "SELECT COUNT(*) FROM question_parameter_versions WHERE question_id = ?;",
+            (qid,),
+        ).fetchone()
+        if int(existing[0]) > 0:
+            continue
+
+        noise_var = float(item.get("noise_var", 1.0))
+        thresholds = list(item.get("thresholds", [-1.5, -0.5, 0.5, 1.5]))
+
+        insert_question_parameter_version(
+            conn,
+            question_id=str(qid),
+            w=list(w_raw),
+            noise_var=noise_var,
+            thresholds=thresholds,
+            source="seed",
+            active=True,
+        )
 

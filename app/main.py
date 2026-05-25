@@ -41,6 +41,7 @@ app = FastAPI(title="Synchronicity Pilot Backend", version="0.1.0")
 def _startup() -> None:
     conn = db.connect(DB_PATH)
     db.init_db(conn)
+    db.seed_question_parameters(conn, QUESTIONS_PATH)
     conn.close()
 
 
