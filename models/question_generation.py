@@ -162,6 +162,7 @@ def generate_candidate_questions(
     llm_client: LLMClient,
     seed_questions: List[dict],
     n_candidates: int = 10,
+    prompt: str | None = None,
 ) -> List[dict]:
     """
     Build prompt, call the client, parse numbered output into candidate dicts.
@@ -170,11 +171,14 @@ def generate_candidate_questions(
         llm_client: Any object implementing ``complete(prompt: str) -> str``.
         seed_questions: Seed items (typically with ``"text"``).
         n_candidates: How many candidates to ask for.
+        prompt: Pre-rendered prompt string. If provided, skips ``build_generation_prompt``.
+                Used by ``render_prompt_policy`` callers (Phase 5).
 
     Returns:
         List of ``{{"text": "..."}}`` dicts (may be fewer if parsing drops lines).
     """
-    prompt = build_generation_prompt(seed_questions, n_candidates)
+    if prompt is None:
+        prompt = build_generation_prompt(seed_questions, n_candidates)
     raw = llm_client.complete(prompt)
     return parse_candidate_output(raw)
 

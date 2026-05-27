@@ -170,6 +170,7 @@ def build_generated_pool(
     seed_items: List[dict],
     n_candidates: int = 10,
     k: int = 3,
+    prompt: Optional[str] = None,
 ) -> GeneratedPoolResult:
     """
     Generate candidate question texts with the LLM client, deduplicate, assign provisional
@@ -185,6 +186,9 @@ def build_generated_pool(
         seed_items: Seeds with ``text`` and ``w`` (and optional ``id``).
         n_candidates: Number of LLM candidates to request.
         k: Nearest neighbors for ``w`` averaging in ``assign_w_to_candidates``.
+        prompt: Pre-rendered prompt string from a PromptPolicy. If None, falls back to
+                ``build_generation_prompt`` (backward-compatible). Passed through to
+                ``generate_candidate_questions``.
     """
     from models.question_bank import DEFAULT_NOISE_VAR, DEFAULT_THRESHOLDS
 
@@ -192,6 +196,7 @@ def build_generated_pool(
         llm_client,
         seed_questions=seed_items,
         n_candidates=n_candidates,
+        prompt=prompt,
     )
     if not candidates:
         return GeneratedPoolResult(accepted=[], all_candidates_metadata=[])

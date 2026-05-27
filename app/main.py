@@ -6,6 +6,10 @@ Endpoints:
 - GET  /next_question/{session_id}
 - POST /answer
 - GET  /session_summary/{session_id}
+- POST /register_user
+- GET  /user/{user_id}
+- GET  /user/{user_id}/posterior
+- GET  /session/{session_id}/posterior_history
 """
 
 from __future__ import annotations
@@ -16,10 +20,19 @@ import sqlite3
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from app import db
-from app.session_manager import Mode, create_session, get_next_question, get_session_summary, record_answer
+from app.session_manager import (
+    Mode,
+    create_session,
+    get_next_question,
+    get_question_num_categories,
+    get_session_summary,
+    record_answer,
+)
+from models.prompt_policy import GENERIC_TEMPLATE
 
 
 def _env(name: str, default: str) -> str:
@@ -33,8 +46,21 @@ LATENT_DIM = int(os.environ.get("LATENT_DIM", "5"))
 ANTHROPIC_API_KEY = _env("ANTHROPIC_API_KEY", "")   # empty string → DummyLLMClient
 LLM_MODEL = _env("LLM_MODEL", "")                   # empty string → DEFAULT_LLM_MODEL
 
+# Comma-separated allowed origins for the React dev server.
+# Override via FRONTEND_ORIGINS env var; defaults to common Vite and CRA ports.
+_FRONTEND_ORIGINS_RAW = _env("FRONTEND_ORIGINS", "http://localhost:3000,http://localhost:5173")
+FRONTEND_ORIGINS = [o.strip() for o in _FRONTEND_ORIGINS_RAW.split(",") if o.strip()]
+
 
 app = FastAPI(title="Synchronicity Pilot Backend", version="0.1.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=FRONTEND_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 @app.on_event("startup")
@@ -42,6 +68,7 @@ def _startup() -> None:
     conn = db.connect(DB_PATH)
     db.init_db(conn)
     db.seed_question_parameters(conn, QUESTIONS_PATH)
+    db.seed_prompt_policies(conn, GENERIC_TEMPLATE)
     conn.close()
 
 
@@ -70,6 +97,11 @@ def start_session(req: StartSessionRequest) -> StartSessionResponse:
     conn = db.connect(DB_PATH)
     db.init_db(conn)
     try:
+        # Reject a provided user_id that does not exist — do not silently treat it as anonymous.
+        if req.user_id:
+            user = db.get_user(conn, req.user_id)
+            if user is None:
+                raise HTTPException(status_code=404, detail="User not found")
         session_id, first_q = create_session(
             conn,
             questions_v2_path=QUESTIONS_PATH,
@@ -83,6 +115,8 @@ def start_session(req: StartSessionRequest) -> StartSessionResponse:
             user_id=req.user_id or None,
         )
         return StartSessionResponse(session_id=session_id, first_question=QuestionModel(**first_q.__dict__))
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     finally:
@@ -99,8 +133,8 @@ def next_question(session_id: str):
             return {"session_id": session_id, "status": "complete", "next_question": None}
         sess = db.get_session(conn, session_id)
         return {"session_id": session_id, "status": sess.status, "next_question": q.__dict__}
-    except KeyError as e:
-        raise HTTPException(status_code=404, detail=str(e)) from e
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Session not found")
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     finally:
@@ -110,7 +144,8 @@ def next_question(session_id: str):
 class AnswerRequest(BaseModel):
     session_id: str
     question_id: str
-    response: int = Field(..., ge=1, le=10)
+    # 5-point Likert; further validated per-question against actual num_categories.
+    response: int = Field(..., ge=1, le=5)
 
 
 @app.post("/answer")
@@ -118,6 +153,20 @@ def answer(req: AnswerRequest):
     conn = db.connect(DB_PATH)
     db.init_db(conn)
     try:
+        # Validate response value against the actual question's num_categories before
+        # calling record_answer, so the client gets a clean 422 with a descriptive message.
+        num_cat = get_question_num_categories(
+            conn,
+            questions_v2_path=QUESTIONS_PATH,
+            session_id=req.session_id,
+            question_id=req.question_id,
+            dim=LATENT_DIM,
+        )
+        if num_cat is not None and (req.response < 1 or req.response > num_cat):
+            raise HTTPException(
+                status_code=422,
+                detail=f"response must be between 1 and {num_cat} (question has {num_cat} categories)",
+            )
         return record_answer(
             conn,
             questions_v2_path=QUESTIONS_PATH,
@@ -126,10 +175,14 @@ def answer(req: AnswerRequest):
             response=req.response,
             dim=LATENT_DIM,
         )
-    except sqlite3.IntegrityError as e:
-        raise HTTPException(status_code=409, detail="Duplicate answer for this session/question") from e
+    except HTTPException:
+        raise
+    except sqlite3.IntegrityError:
+        raise HTTPException(status_code=409, detail="Duplicate answer for this session/question")
     except KeyError as e:
-        raise HTTPException(status_code=404, detail=str(e)) from e
+        raise HTTPException(status_code=404, detail=e.args[0] if e.args else "Session or question not found")
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     finally:
@@ -142,8 +195,8 @@ def session_summary(session_id: str):
     db.init_db(conn)
     try:
         return get_session_summary(conn, questions_v2_path=QUESTIONS_PATH, session_id=session_id, dim=LATENT_DIM)
-    except KeyError as e:
-        raise HTTPException(status_code=404, detail=str(e)) from e
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Session not found")
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     finally:
@@ -203,14 +256,12 @@ def get_posterior_history(session_id: str):
     conn = db.connect(DB_PATH)
     db.init_db(conn)
     try:
-        # Verify session exists before fetching snapshots.
         db.get_session(conn, session_id)
         snapshots = db.list_posterior_snapshots(conn, session_id)
         return {"session_id": session_id, "snapshots": snapshots}
-    except KeyError as e:
-        raise HTTPException(status_code=404, detail=str(e)) from e
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Session not found")
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     finally:
         conn.close()
-

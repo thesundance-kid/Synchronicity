@@ -137,6 +137,13 @@ make_llm_client() → generate_candidate_questions() → _dedupe_generated_candi
 |---|---|
 | `question_parameter_versions` | Versioned measurement parameters per question. Fields: `question_id`, `version` (auto-incremented per question), `w_json`, `noise_var`, `thresholds_json`, `source` (`'seed'` or `'estimated'`), `estimation_method`, `n_responses_used`, `performance_summary_json`, `active` (only one active per question at a time), `created_at`. UNIQUE(question_id, version). Seeded at startup via `db.seed_question_parameters()` — idempotent. |
 
+### Phase 5 tables (prompt/probe-generation policy tracking)
+| Table | Purpose |
+|---|---|
+| `prompt_policy_versions` | Versioned LLM prompt strategies. Fields: `name`, `version` (auto-incremented per name), `prompt_template`, `strategy_type` (`'generic'`, `'uncertainty_targeted'`, etc.), `conditioning_mode` (`'none'`, `'posterior_only'`, `'posterior_plus_history'`, etc.), `output_schema_json` (reserved for future structured output), `active` (one globally-active policy at a time), `created_at`. Seeded at startup via `db.seed_prompt_policies()` — idempotent. |
+| `llm_generation_requests` | One row per LLM candidate-generation event. Links session → policy → posterior context → rendered prompt → candidates. Fields: `session_id`, `user_id`, `step_idx`, `prompt_policy_version_id`, `posterior_mu_json`, `posterior_sigma_json`, `entropy_before`, `uncertainty_summary_json`, `question_history_summary_json`, `answer_history_summary_json`, `unresolved_tensions_json`, `prompt_rendered`, `model_name`, `n_requested`, `n_returned`, `created_at`. |
+| `generated_question_candidates` | (Phase 3, augmented in Phase 5) Now also carries `generation_request_id` (FK to `llm_generation_requests`) and `prompt_policy_version_id` (FK to `prompt_policy_versions`) for full policy → request → candidate lineage. |
+
 ---
 
 ## Session flow (key paths)
@@ -173,6 +180,9 @@ make_llm_client() → generate_candidate_questions() → _dedupe_generated_candi
 - **Phase 2 complete:** `question_performance_events` — full before/after posterior per inference answer
 - **Phase 3 complete:** `generated_question_candidates` — all raw LLM candidates logged per session (accepted + rejected), with dedupe scores, validation reasons, nn_seed_ids, nn_similarities, and `selected_at_step` filled when EIG picks a generated question
 - **Phase 4 complete:** `question_parameter_versions` — versioned w/noise_var/thresholds; seeded at startup via `db.seed_question_parameters()`; `parameter_version` populated in performance events
+- **Frontend-readiness pass complete:** CORS configured (origins from `FRONTEND_ORIGINS` env var, defaults to `localhost:3000` and `localhost:5173`); `AnswerRequest.response` tightened to `le=5`; endpoint-level per-question validation via `get_question_num_categories`; invalid `user_id` in `/start_session` returns clean 404; common error responses cleaned up; `test_frontend_readiness.py` added (21 assertions)
+- **Phase 5 complete:** prompt/probe-generation policy tracking — `prompt_policy_versions`, `llm_generation_requests`, and Phase 3 lineage columns (`generation_request_id`, `prompt_policy_version_id`) on `generated_question_candidates`; `models/prompt_policy.py` with `PromptPolicy`, `render_prompt_policy`, `GENERIC_TEMPLATE`; generic policy seeded at startup; `scripts/query_prompt_policy_stats.py` (read-only analytics); `test_phase5_prompt_policy.py` (46 assertions). All three learning layers now instrumented: (1) user posterior, (2) question performance, (3) generation policy.
+- Scientific core (`personality_state.py`, `question_selection.py`) untouched throughout all phases
 - Frontend: not yet built
 
 ---
@@ -181,8 +191,9 @@ make_llm_client() → generate_candidate_questions() → _dedupe_generated_candi
 
 1. ~~**Phase 3**~~ — complete
 2. ~~**Phase 4**~~ — complete
-3. **Phase 5** — admin/query endpoints (question stats, generated question analytics)
-4. **Minimal frontend** — session UI that drives the `/start_session` → `/answer` loop
+3. ~~**Frontend-readiness pass**~~ — complete (CORS, answer validation, user_id 404, error cleanup)
+4. ~~**Phase 5**~~ — complete (prompt policy tracking, generation request logging, lineage, read-only analytics)
+5. **Minimal frontend** — session UI that drives the `/start_session` → `/answer` loop
 5. **Uncertainty visualization** — display trait posterior (μ ± σ) as the session progresses
 6. **Final profile page** — probabilistic Big Five summary at session end
 7. **Adaptive cognitive inference** — extend latent-state framework beyond personality (delirium, cognitive load, etc.)
@@ -209,6 +220,12 @@ python scripts/test_phase3_generated_candidates.py  # candidate logging, rejecti
 
 # Phase 4: versioned question parameters
 python scripts/test_phase4_question_parameter_versions.py  # seeding, versioning, record_answer integration (38 assertions)
+
+# Phase 5: prompt policy and generation request tracking
+python scripts/test_phase5_prompt_policy.py                # policy seeding, lineage, failure handling, read-only stats (46 assertions)
+
+# Frontend readiness
+python scripts/test_frontend_readiness.py                  # CORS, user validation, answer validation, flow (21 assertions)
 
 # Live generation path
 ANTHROPIC_API_KEY=sk-ant-... python scripts/test_v2_lite_session.py

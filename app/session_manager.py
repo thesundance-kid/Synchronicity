@@ -18,7 +18,8 @@ import numpy as np
 from app import db
 from models.personality_state import PersonalityState
 from models.question_bank import DEFAULT_THRESHOLDS, Question, load_question_pools_v2
-from models.question_generation import make_llm_client
+from models.prompt_policy import PromptPolicy, render_prompt_policy
+from models.question_generation import DEFAULT_LLM_MODEL, make_llm_client
 from models.question_pool_builder import build_generated_pool, build_session_inference_pool
 from models.question_selection import expected_information_gain, select_next_question_eig
 from models.real_eval import evaluate_heldout_performance
@@ -235,7 +236,23 @@ def create_session(
     use_generated = should_use_generated_questions(arm)
     generated_stored: Optional[List[Dict[str, Any]]] = None
     generated_candidates_metadata: Optional[List[Dict[str, Any]]] = None
+
+    # Phase 5: look up active prompt policy and render prompt before LLM call.
+    # rendered_prompt=None → build_generated_pool falls back to build_generation_prompt.
+    rendered_prompt: Optional[str] = None
+    policy_version_id: Optional[int] = None
+    n_returned: int = 0
+
     if use_generated:
+        _policy_row = db.get_active_prompt_policy_version(conn)
+        if _policy_row is not None:
+            policy_version_id = int(_policy_row["id"])
+            rendered_prompt = render_prompt_policy(
+                PromptPolicy.from_row(_policy_row),
+                seeds_for_generation,
+                n_generation_candidates,
+            )
+
         if llm_client is not None:
             client = llm_client
         else:
@@ -246,9 +263,11 @@ def create_session(
                 seeds_for_generation,
                 n_candidates=n_generation_candidates,
                 k=nn_k,
+                prompt=rendered_prompt,
             )
             generated_stored = [_jsonable_question_dict(x) for x in gen_result.accepted]
             generated_candidates_metadata = gen_result.all_candidates_metadata
+            n_returned = len(generated_candidates_metadata)
         except Exception as exc:  # noqa: BLE001
             import warnings
             warnings.warn(
@@ -257,6 +276,7 @@ def create_session(
             )
             generated_stored = None
             generated_candidates_metadata = None
+            n_returned = 0
 
     final_inference_dicts = build_session_inference_pool(seed_stored, generated_stored if use_generated else None)
     inference_ids = {d["id"] for d in final_inference_dicts}
@@ -324,7 +344,41 @@ def create_session(
         entropy=initial_entropy,
     )
 
+    # Phase 5: log the LLM generation request (always when use_generated, even on failure).
+    # Session must exist in DB before inserting this row (FK constraint).
+    gen_request_id: Optional[int] = None
+    if use_generated:
+        import numpy as _np
+        _sigma_arr = _np.asarray(sigma)
+        _variances = _np.diag(_sigma_arr).tolist()
+        try:
+            gen_request_id = db.insert_llm_generation_request(
+                conn,
+                session_id=session_id,
+                user_id=user_id,
+                step_idx=0,
+                prompt_policy_version_id=policy_version_id,
+                posterior_mu=mu,
+                posterior_sigma=sigma,
+                entropy_before=initial_entropy,
+                uncertainty_summary={
+                    "entropy": initial_entropy,
+                    "trait_variances": _variances,
+                },
+                question_history_summary=None,
+                answer_history_summary=None,
+                unresolved_tensions=None,
+                prompt_rendered=rendered_prompt,
+                model_name=llm_model or DEFAULT_LLM_MODEL,
+                n_requested=n_generation_candidates,
+                n_returned=n_returned,
+            )
+        except Exception as exc:  # noqa: BLE001
+            import warnings
+            warnings.warn(f"Failed to persist LLM generation request: {exc}", stacklevel=2)
+
     # Phase 3: persist generated candidate metadata (all raw LLM candidates, including rejected).
+    # Phase 5: attach generation_request_id and prompt_policy_version_id for full lineage.
     if generated_candidates_metadata is not None:
         for meta in generated_candidates_metadata:
             try:
@@ -345,6 +399,8 @@ def create_session(
                     thresholds=meta.get("thresholds"),
                     nn_seed_ids=meta.get("nn_seed_ids"),
                     nn_similarities=meta.get("nn_similarities"),
+                    generation_request_id=gen_request_id,
+                    prompt_policy_version_id=policy_version_id,
                 )
             except Exception as exc:  # noqa: BLE001
                 import warnings
@@ -596,6 +652,26 @@ def record_answer(
         "step": sess2.step,
         "next_question": next_q.__dict__ if next_q is not None else None,
     }
+
+
+def get_question_num_categories(
+    conn,
+    *,
+    questions_v2_path: str,
+    session_id: str,
+    question_id: str,
+    dim: int = 5,
+) -> Optional[int]:
+    """Return num_categories for question_id in this session, or None if session/question not found."""
+    try:
+        sess = db.get_session(conn, session_id)
+    except KeyError:
+        return None
+    qmap = _qmap_with_session_inference(sess, questions_v2_path, dim)
+    q = qmap.get(question_id)
+    if q is None:
+        return None
+    return int(q.thresholds.size + 1)
 
 
 def end_session(conn, *, session_id: str) -> None:

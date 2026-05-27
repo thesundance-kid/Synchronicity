@@ -82,6 +82,20 @@ def connect(db_path: str) -> sqlite3.Connection:
     return conn
 
 
+def _migrate_generated_candidates_phase5(conn: sqlite3.Connection) -> None:
+    """Add Phase 5 lineage columns to generated_question_candidates (idempotent)."""
+    info = conn.execute("PRAGMA table_info(generated_question_candidates);").fetchall()
+    col_names = {row[1] for row in info}
+    if "generation_request_id" not in col_names:
+        conn.execute(
+            "ALTER TABLE generated_question_candidates ADD COLUMN generation_request_id INTEGER;"
+        )
+    if "prompt_policy_version_id" not in col_names:
+        conn.execute(
+            "ALTER TABLE generated_question_candidates ADD COLUMN prompt_policy_version_id INTEGER;"
+        )
+
+
 def _migrate_sessions_user(conn: sqlite3.Connection) -> None:
     """Add user_id and prior_session_id columns to sessions (Phase 1)."""
     info = conn.execute("PRAGMA table_info(sessions);").fetchall()
@@ -305,34 +319,86 @@ def init_db(conn: sqlite3.Connection) -> None:
         """
     )
 
-    # Phase 3: per-session metadata for every raw LLM-generated candidate question.
-    # Stores accepted and rejected candidates so generation quality can be analyzed later.
+    # Phase 5: versioned prompt/probe-generation policy.
+    # Only one row may be active=1 at a time (globally, not per-name).
     conn.execute(
         """
-        CREATE TABLE IF NOT EXISTS generated_question_candidates (
-          id                      INTEGER PRIMARY KEY AUTOINCREMENT,
-          session_id              TEXT    NOT NULL,
-          candidate_index         INTEGER NOT NULL,
-          text                    TEXT    NOT NULL,
-          question_id             TEXT,
-          max_seed_similarity     REAL,
-          max_kept_similarity     REAL,
-          dedupe_failed           INTEGER NOT NULL DEFAULT 0,
-          validation_passed       INTEGER NOT NULL DEFAULT 0,
-          validation_failure_reason TEXT,
-          accepted_into_pool      INTEGER NOT NULL DEFAULT 0,
-          w_json                  TEXT,
-          noise_var               REAL,
-          thresholds_json         TEXT,
-          nn_seed_ids_json        TEXT,
-          nn_similarities_json    TEXT,
-          selected_at_step        INTEGER,
-          created_at              INTEGER NOT NULL,
-          UNIQUE(session_id, candidate_index),
-          FOREIGN KEY(session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
+        CREATE TABLE IF NOT EXISTS prompt_policy_versions (
+          id                INTEGER PRIMARY KEY AUTOINCREMENT,
+          name              TEXT    NOT NULL,
+          version           INTEGER NOT NULL,
+          strategy_type     TEXT    NOT NULL DEFAULT 'generic',
+          prompt_template   TEXT    NOT NULL,
+          conditioning_mode TEXT    NOT NULL DEFAULT 'none',
+          output_schema_json TEXT,
+          active            INTEGER NOT NULL DEFAULT 1,
+          created_at        INTEGER NOT NULL,
+          UNIQUE(name, version)
         );
         """
     )
+
+    # Phase 5: one row per LLM candidate-generation event.
+    # Links session → prompt policy → posterior context → rendered prompt → candidates.
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS llm_generation_requests (
+          id                           INTEGER PRIMARY KEY AUTOINCREMENT,
+          session_id                   TEXT    NOT NULL,
+          user_id                      TEXT,
+          step_idx                     INTEGER NOT NULL DEFAULT 0,
+          prompt_policy_version_id     INTEGER,
+          posterior_mu_json            TEXT,
+          posterior_sigma_json         TEXT,
+          entropy_before               REAL,
+          uncertainty_summary_json     TEXT,
+          question_history_summary_json TEXT,
+          answer_history_summary_json  TEXT,
+          unresolved_tensions_json     TEXT,
+          prompt_rendered              TEXT,
+          model_name                   TEXT,
+          n_requested                  INTEGER NOT NULL DEFAULT 0,
+          n_returned                   INTEGER NOT NULL DEFAULT 0,
+          created_at                   INTEGER NOT NULL,
+          FOREIGN KEY(session_id) REFERENCES sessions(session_id) ON DELETE CASCADE,
+          FOREIGN KEY(prompt_policy_version_id) REFERENCES prompt_policy_versions(id)
+        );
+        """
+    )
+
+    # Phase 3: per-session metadata for every raw LLM-generated candidate question.
+    # Phase 5 adds generation_request_id and prompt_policy_version_id for full lineage.
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS generated_question_candidates (
+          id                        INTEGER PRIMARY KEY AUTOINCREMENT,
+          session_id                TEXT    NOT NULL,
+          candidate_index           INTEGER NOT NULL,
+          text                      TEXT    NOT NULL,
+          question_id               TEXT,
+          max_seed_similarity       REAL,
+          max_kept_similarity       REAL,
+          dedupe_failed             INTEGER NOT NULL DEFAULT 0,
+          validation_passed         INTEGER NOT NULL DEFAULT 0,
+          validation_failure_reason TEXT,
+          accepted_into_pool        INTEGER NOT NULL DEFAULT 0,
+          w_json                    TEXT,
+          noise_var                 REAL,
+          thresholds_json           TEXT,
+          nn_seed_ids_json          TEXT,
+          nn_similarities_json      TEXT,
+          selected_at_step          INTEGER,
+          generation_request_id     INTEGER,
+          prompt_policy_version_id  INTEGER,
+          created_at                INTEGER NOT NULL,
+          UNIQUE(session_id, candidate_index),
+          FOREIGN KEY(session_id) REFERENCES sessions(session_id) ON DELETE CASCADE,
+          FOREIGN KEY(generation_request_id) REFERENCES llm_generation_requests(id),
+          FOREIGN KEY(prompt_policy_version_id) REFERENCES prompt_policy_versions(id)
+        );
+        """
+    )
+    _migrate_generated_candidates_phase5(conn)
     conn.commit()
 
 
@@ -1047,6 +1113,8 @@ def insert_generated_question_candidate(
     thresholds: Optional[Sequence[float]],
     nn_seed_ids: Optional[Sequence[Any]],
     nn_similarities: Optional[Sequence[float]],
+    generation_request_id: Optional[int] = None,
+    prompt_policy_version_id: Optional[int] = None,
 ) -> None:
     conn.execute(
         """
@@ -1057,8 +1125,10 @@ def insert_generated_question_candidate(
           accepted_into_pool,
           w_json, noise_var, thresholds_json,
           nn_seed_ids_json, nn_similarities_json,
-          selected_at_step, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+          selected_at_step,
+          generation_request_id, prompt_policy_version_id,
+          created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
         """,
         (
             session_id,
@@ -1077,6 +1147,8 @@ def insert_generated_question_candidate(
             _dumps(list(nn_seed_ids)) if nn_seed_ids is not None else None,
             _dumps(list(nn_similarities)) if nn_similarities is not None else None,
             None,  # selected_at_step starts NULL
+            int(generation_request_id) if generation_request_id is not None else None,
+            int(prompt_policy_version_id) if prompt_policy_version_id is not None else None,
             _utc_ts(),
         ),
     )
@@ -1112,7 +1184,9 @@ def list_generated_question_candidates(
                accepted_into_pool,
                w_json, noise_var, thresholds_json,
                nn_seed_ids_json, nn_similarities_json,
-               selected_at_step, created_at
+               selected_at_step,
+               generation_request_id, prompt_policy_version_id,
+               created_at
         FROM generated_question_candidates
         WHERE session_id = ?
         ORDER BY candidate_index ASC, id ASC;
@@ -1143,6 +1217,14 @@ def list_generated_question_candidates(
             "nn_similarities": _loads(r["nn_similarities_json"], None),
             "selected_at_step": (
                 int(r["selected_at_step"]) if r["selected_at_step"] is not None else None
+            ),
+            "generation_request_id": (
+                int(r["generation_request_id"]) if r["generation_request_id"] is not None else None
+            ),
+            "prompt_policy_version_id": (
+                int(r["prompt_policy_version_id"])
+                if r["prompt_policy_version_id"] is not None
+                else None
             ),
             "created_at": int(r["created_at"]),
         }
@@ -1302,4 +1384,213 @@ def seed_question_parameters(conn: sqlite3.Connection, questions_v2_path: str) -
             source="seed",
             active=True,
         )
+
+
+# ---------------------------------------------------------------------------
+# Phase 5: prompt_policy_versions
+# ---------------------------------------------------------------------------
+
+def _ppv_row_to_dict(r) -> Dict[str, Any]:
+    return {
+        "id": int(r["id"]),
+        "name": r["name"],
+        "version": int(r["version"]),
+        "strategy_type": r["strategy_type"],
+        "prompt_template": r["prompt_template"],
+        "conditioning_mode": r["conditioning_mode"],
+        "output_schema_json": r["output_schema_json"],
+        "active": bool(r["active"]),
+        "created_at": int(r["created_at"]),
+    }
+
+
+def insert_prompt_policy_version(
+    conn: sqlite3.Connection,
+    *,
+    name: str,
+    prompt_template: str,
+    strategy_type: str = "generic",
+    conditioning_mode: str = "none",
+    output_schema: Optional[Dict[str, Any]] = None,
+    active: bool = True,
+) -> int:
+    """
+    Insert a new prompt policy version for *name* and return its (id, version).
+
+    Version is auto-incremented (max existing + 1 for this name, or 1 if none).
+    If *active* is True, all prior active rows across the whole table are deactivated
+    first (only one globally active policy at a time).
+    Returns the new row's ``id``.
+    """
+    if active:
+        conn.execute("UPDATE prompt_policy_versions SET active = 0 WHERE active = 1;")
+
+    row = conn.execute(
+        "SELECT COALESCE(MAX(version), 0) FROM prompt_policy_versions WHERE name = ?;",
+        (name,),
+    ).fetchone()
+    next_version = int(row[0]) + 1
+
+    conn.execute(
+        """
+        INSERT INTO prompt_policy_versions
+          (name, version, strategy_type, prompt_template, conditioning_mode,
+           output_schema_json, active, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?);
+        """,
+        (
+            str(name),
+            next_version,
+            str(strategy_type),
+            str(prompt_template),
+            str(conditioning_mode),
+            _dumps(output_schema) if output_schema is not None else None,
+            1 if active else 0,
+            _utc_ts(),
+        ),
+    )
+    conn.commit()
+    row_id = conn.execute("SELECT last_insert_rowid();").fetchone()[0]
+    return int(row_id)
+
+
+def get_active_prompt_policy_version(
+    conn: sqlite3.Connection,
+) -> Optional[Dict[str, Any]]:
+    """Return the single globally-active prompt policy row, or None."""
+    row = conn.execute(
+        "SELECT * FROM prompt_policy_versions WHERE active = 1 LIMIT 1;"
+    ).fetchone()
+    return _ppv_row_to_dict(row) if row is not None else None
+
+
+def list_prompt_policy_versions(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
+    """Return all prompt policy versions ordered by (name, version ASC)."""
+    rows = conn.execute(
+        "SELECT * FROM prompt_policy_versions ORDER BY name ASC, version ASC;"
+    ).fetchall()
+    return [_ppv_row_to_dict(r) for r in rows]
+
+
+def seed_prompt_policies(conn: sqlite3.Connection, generic_template: str) -> None:
+    """
+    Insert the initial 'generic' prompt policy (v1) if no policy exists yet.
+    Idempotent: skips silently if any prompt_policy_versions row already exists.
+    """
+    existing = conn.execute(
+        "SELECT COUNT(*) FROM prompt_policy_versions;"
+    ).fetchone()
+    if int(existing[0]) > 0:
+        return
+
+    insert_prompt_policy_version(
+        conn,
+        name="generic",
+        prompt_template=generic_template,
+        strategy_type="generic",
+        conditioning_mode="none",
+        active=True,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Phase 5: llm_generation_requests
+# ---------------------------------------------------------------------------
+
+def insert_llm_generation_request(
+    conn: sqlite3.Connection,
+    *,
+    session_id: str,
+    user_id: Optional[str],
+    step_idx: int = 0,
+    prompt_policy_version_id: Optional[int],
+    posterior_mu: Optional[Sequence[float]],
+    posterior_sigma: Optional[Sequence[Sequence[float]]],
+    entropy_before: Optional[float],
+    uncertainty_summary: Optional[Dict[str, Any]],
+    question_history_summary: Optional[Dict[str, Any]],
+    answer_history_summary: Optional[Dict[str, Any]],
+    unresolved_tensions: Optional[Dict[str, Any]],
+    prompt_rendered: Optional[str],
+    model_name: Optional[str],
+    n_requested: int,
+    n_returned: int,
+) -> int:
+    """Insert one LLM generation event and return its row id."""
+    conn.execute(
+        """
+        INSERT INTO llm_generation_requests (
+          session_id, user_id, step_idx, prompt_policy_version_id,
+          posterior_mu_json, posterior_sigma_json, entropy_before,
+          uncertainty_summary_json, question_history_summary_json,
+          answer_history_summary_json, unresolved_tensions_json,
+          prompt_rendered, model_name, n_requested, n_returned, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+        """,
+        (
+            session_id,
+            user_id,
+            int(step_idx),
+            int(prompt_policy_version_id) if prompt_policy_version_id is not None else None,
+            _dumps(list(posterior_mu)) if posterior_mu is not None else None,
+            _dumps([list(r) for r in posterior_sigma]) if posterior_sigma is not None else None,
+            float(entropy_before) if entropy_before is not None else None,
+            _dumps(uncertainty_summary) if uncertainty_summary is not None else None,
+            _dumps(question_history_summary) if question_history_summary is not None else None,
+            _dumps(answer_history_summary) if answer_history_summary is not None else None,
+            _dumps(unresolved_tensions) if unresolved_tensions is not None else None,
+            prompt_rendered,
+            model_name,
+            int(n_requested),
+            int(n_returned),
+            _utc_ts(),
+        ),
+    )
+    conn.commit()
+    row_id = conn.execute("SELECT last_insert_rowid();").fetchone()[0]
+    return int(row_id)
+
+
+def list_llm_generation_requests_for_session(
+    conn: sqlite3.Connection, session_id: str
+) -> List[Dict[str, Any]]:
+    rows = conn.execute(
+        """
+        SELECT id, session_id, user_id, step_idx, prompt_policy_version_id,
+               posterior_mu_json, posterior_sigma_json, entropy_before,
+               uncertainty_summary_json, question_history_summary_json,
+               answer_history_summary_json, unresolved_tensions_json,
+               prompt_rendered, model_name, n_requested, n_returned, created_at
+        FROM llm_generation_requests
+        WHERE session_id = ?
+        ORDER BY id ASC;
+        """,
+        (session_id,),
+    ).fetchall()
+    return [
+        {
+            "id": int(r["id"]),
+            "session_id": r["session_id"],
+            "user_id": r["user_id"],
+            "step_idx": int(r["step_idx"]),
+            "prompt_policy_version_id": (
+                int(r["prompt_policy_version_id"])
+                if r["prompt_policy_version_id"] is not None
+                else None
+            ),
+            "posterior_mu": _loads(r["posterior_mu_json"], None),
+            "posterior_sigma": _loads(r["posterior_sigma_json"], None),
+            "entropy_before": float(r["entropy_before"]) if r["entropy_before"] is not None else None,
+            "uncertainty_summary": _loads(r["uncertainty_summary_json"], None),
+            "question_history_summary": _loads(r["question_history_summary_json"], None),
+            "answer_history_summary": _loads(r["answer_history_summary_json"], None),
+            "unresolved_tensions": _loads(r["unresolved_tensions_json"], None),
+            "prompt_rendered": r["prompt_rendered"],
+            "model_name": r["model_name"],
+            "n_requested": int(r["n_requested"]),
+            "n_returned": int(r["n_returned"]),
+            "created_at": int(r["created_at"]),
+        }
+        for r in rows
+    ]
 
