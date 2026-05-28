@@ -67,21 +67,56 @@ def query_prompt_policy_stats(
             params,
         ).fetchall()
 
+        # Detect Phase 6 columns (may not exist on older DBs).
+        _lgr_cols: set = set()
+        if "llm_generation_requests" in tables:
+            _lgr_info = conn.execute(
+                "PRAGMA table_info(llm_generation_requests);"
+            ).fetchall()
+            _lgr_cols = {row[1] for row in _lgr_info}
+        _has_lgr_status = "status" in _lgr_cols
+
+        _qpe_cols: set = set()
+        if "question_performance_events" in tables:
+            _qpe_info = conn.execute(
+                "PRAGMA table_info(question_performance_events);"
+            ).fetchall()
+            _qpe_cols = {row[1] for row in _qpe_info}
+        _has_direct_lineage = "generation_request_id" in _qpe_cols
+
         results = []
         for ppv in rows:
             pid = int(ppv["id"])
 
-            # Generation request stats.
-            req_row = conn.execute(
-                """
-                SELECT COUNT(*) AS n_requests,
-                       SUM(n_requested) AS n_requested_total,
-                       SUM(n_returned) AS n_returned_total
-                FROM llm_generation_requests
-                WHERE prompt_policy_version_id = ?;
-                """,
-                (pid,),
-            ).fetchone()
+            # Generation request stats — include failure counts if Phase 6 columns exist.
+            if _has_lgr_status:
+                req_row = conn.execute(
+                    """
+                    SELECT COUNT(*) AS n_requests,
+                           SUM(n_requested) AS n_requested_total,
+                           SUM(n_returned) AS n_returned_total,
+                           SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS n_failed,
+                           SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END) AS n_success
+                    FROM llm_generation_requests
+                    WHERE prompt_policy_version_id = ?;
+                    """,
+                    (pid,),
+                ).fetchone()
+                n_requests_failed = int(req_row["n_failed"] or 0)
+                n_requests_success = int(req_row["n_success"] or 0)
+            else:
+                req_row = conn.execute(
+                    """
+                    SELECT COUNT(*) AS n_requests,
+                           SUM(n_requested) AS n_requested_total,
+                           SUM(n_returned) AS n_returned_total
+                    FROM llm_generation_requests
+                    WHERE prompt_policy_version_id = ?;
+                    """,
+                    (pid,),
+                ).fetchone()
+                n_requests_failed = None
+                n_requests_success = None
             n_requests = int(req_row["n_requests"] or 0)
             n_returned_total = int(req_row["n_returned_total"] or 0)
 
@@ -111,30 +146,63 @@ def query_prompt_policy_stats(
             dedupe_failure_rate = n_dedupe_failed / n_logged if n_logged > 0 else None
             validation_failure_rate = n_validation_failed / n_logged if n_logged > 0 else None
 
-            # Performance stats via join: candidates → question_performance_events.
-            # Matches on (question_id, session_id) to scope to this policy's generated questions.
+            # Performance stats via question_performance_events.
+            # Phase 6: use direct lineage join (qpe.generation_request_id → lgr) when available;
+            # fall back to indirect join via generated_question_candidates for older DBs.
             has_qpe = "question_performance_events" in tables
             mean_predicted_eig = None
             mean_realized_ig = None
             mean_entropy_drop = None
             n_with_perf = 0
+            n_answered_generated = 0
 
             if has_qpe:
-                perf_row = conn.execute(
-                    """
-                    SELECT COUNT(qpe.id)               AS n_perf,
-                           AVG(qpe.predicted_eig)      AS mean_predicted_eig,
-                           AVG(qpe.realized_information_gain) AS mean_realized_ig,
-                           AVG(qpe.entropy_before - qpe.entropy_after) AS mean_entropy_drop
-                    FROM generated_question_candidates gqc
-                    JOIN question_performance_events qpe
-                      ON qpe.question_id = gqc.question_id
-                     AND qpe.session_id  = gqc.session_id
-                    WHERE gqc.prompt_policy_version_id = ?
-                      AND gqc.selected_at_step IS NOT NULL;
-                    """,
-                    (pid,),
-                ).fetchone()
+                if _has_direct_lineage:
+                    # Phase 6 direct path: qpe.generation_request_id joins to lgr.
+                    perf_row = conn.execute(
+                        """
+                        SELECT COUNT(qpe.id)               AS n_perf,
+                               AVG(qpe.predicted_eig)      AS mean_predicted_eig,
+                               AVG(qpe.realized_information_gain) AS mean_realized_ig,
+                               AVG(qpe.entropy_before - qpe.entropy_after) AS mean_entropy_drop
+                        FROM question_performance_events qpe
+                        JOIN llm_generation_requests lgr
+                          ON qpe.generation_request_id = lgr.id
+                        WHERE lgr.prompt_policy_version_id = ?;
+                        """,
+                        (pid,),
+                    ).fetchone()
+                    answered_row = conn.execute(
+                        """
+                        SELECT COUNT(DISTINCT qpe.id) AS n_answered
+                        FROM question_performance_events qpe
+                        JOIN llm_generation_requests lgr
+                          ON qpe.generation_request_id = lgr.id
+                        WHERE lgr.prompt_policy_version_id = ?
+                          AND qpe.question_source = 'generated';
+                        """,
+                        (pid,),
+                    ).fetchone()
+                    n_answered_generated = int(answered_row["n_answered"] or 0)
+                else:
+                    # Fallback: indirect join via generated_question_candidates.
+                    perf_row = conn.execute(
+                        """
+                        SELECT COUNT(qpe.id)               AS n_perf,
+                               AVG(qpe.predicted_eig)      AS mean_predicted_eig,
+                               AVG(qpe.realized_information_gain) AS mean_realized_ig,
+                               AVG(qpe.entropy_before - qpe.entropy_after) AS mean_entropy_drop
+                        FROM generated_question_candidates gqc
+                        JOIN question_performance_events qpe
+                          ON qpe.question_id = gqc.question_id
+                         AND qpe.session_id  = gqc.session_id
+                        WHERE gqc.prompt_policy_version_id = ?
+                          AND gqc.selected_at_step IS NOT NULL;
+                        """,
+                        (pid,),
+                    ).fetchone()
+                    n_answered_generated = n_selected  # best approximation without direct lineage
+
                 n_with_perf = int(perf_row["n_perf"] or 0)
                 if n_with_perf > 0:
                     mean_predicted_eig = (
@@ -161,12 +229,15 @@ def query_prompt_policy_stats(
                 "conditioning_mode": ppv["conditioning_mode"],
                 "active": bool(ppv["active"]),
                 "n_requests": n_requests,
+                "n_requests_success": n_requests_success,
+                "n_requests_failed": n_requests_failed,
                 "n_candidates_logged": n_logged,
                 "n_candidates_returned_by_llm": n_returned_total,
                 "n_accepted": n_accepted,
                 "n_dedupe_failed": n_dedupe_failed,
                 "n_validation_failed": n_validation_failed,
                 "n_selected": n_selected,
+                "n_answered_generated": n_answered_generated,
                 "acceptance_rate": acceptance_rate,
                 "selection_rate": selection_rate,
                 "dedupe_failure_rate": dedupe_failure_rate,
@@ -197,7 +268,10 @@ def print_prompt_policy_stats(
         print(f"\n── Policy {s['policy_id']}: {s['name']} v{s['version']}{active_tag} ──")
         print(f"   strategy_type    : {s['strategy_type']}")
         print(f"   conditioning_mode: {s['conditioning_mode']}")
-        print(f"   generation requests      : {s['n_requests']}")
+        req_line = f"   generation requests      : {s['n_requests']}"
+        if s.get("n_requests_failed") is not None:
+            req_line += f"  ({s['n_requests_success']} success, {s['n_requests_failed']} failed)"
+        print(req_line)
         print(f"   candidates returned (LLM): {s['n_candidates_returned_by_llm']}")
         print(f"   candidates logged        : {s['n_candidates_logged']}")
         print(f"   accepted into pool       : {s['n_accepted']}"
@@ -208,6 +282,7 @@ def print_prompt_policy_stats(
               + (f"  ({s['validation_failure_rate']:.1%})" if s['validation_failure_rate'] is not None else ""))
         print(f"   selected (EIG asked)     : {s['n_selected']}"
               + (f"  ({s['selection_rate']:.1%} of accepted)" if s['selection_rate'] is not None else ""))
+        print(f"   answered (user response) : {s.get('n_answered_generated', 'n/a')}")
         if s["n_with_performance_data"] > 0:
             print(f"   perf data (n={s['n_with_performance_data']})")
             if s["mean_predicted_eig"] is not None:

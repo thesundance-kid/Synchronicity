@@ -96,6 +96,38 @@ def _migrate_generated_candidates_phase5(conn: sqlite3.Connection) -> None:
         )
 
 
+def _migrate_question_performance_events_phase6(conn: sqlite3.Connection) -> None:
+    """Add Phase 6 direct lineage columns to question_performance_events (idempotent)."""
+    info = conn.execute("PRAGMA table_info(question_performance_events);").fetchall()
+    col_names = {row[1] for row in info}
+    if "generated_candidate_id" not in col_names:
+        conn.execute(
+            "ALTER TABLE question_performance_events ADD COLUMN generated_candidate_id INTEGER;"
+        )
+    if "generation_request_id" not in col_names:
+        conn.execute(
+            "ALTER TABLE question_performance_events ADD COLUMN generation_request_id INTEGER;"
+        )
+    if "prompt_policy_version_id" not in col_names:
+        conn.execute(
+            "ALTER TABLE question_performance_events ADD COLUMN prompt_policy_version_id INTEGER;"
+        )
+
+
+def _migrate_llm_generation_requests_phase6(conn: sqlite3.Connection) -> None:
+    """Add Phase 6 status/error columns to llm_generation_requests (idempotent)."""
+    info = conn.execute("PRAGMA table_info(llm_generation_requests);").fetchall()
+    col_names = {row[1] for row in info}
+    if "status" not in col_names:
+        conn.execute(
+            "ALTER TABLE llm_generation_requests ADD COLUMN status TEXT NOT NULL DEFAULT 'success';"
+        )
+    if "error_message" not in col_names:
+        conn.execute(
+            "ALTER TABLE llm_generation_requests ADD COLUMN error_message TEXT;"
+        )
+
+
 def _migrate_sessions_user(conn: sqlite3.Connection) -> None:
     """Add user_id and prior_session_id columns to sessions (Phase 1)."""
     info = conn.execute("PRAGMA table_info(sessions);").fetchall()
@@ -271,6 +303,8 @@ def init_db(conn: sqlite3.Connection) -> None:
     )
 
     # Phase 2: per-answer learning signal for question-level performance analysis.
+    # Phase 6: added generated_candidate_id, generation_request_id, prompt_policy_version_id
+    #          for direct lineage to the LLM generation that produced the answered question.
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS question_performance_events (
@@ -290,11 +324,15 @@ def init_db(conn: sqlite3.Connection) -> None:
           sigma_before_json         TEXT    NOT NULL,
           mu_after_json             TEXT    NOT NULL,
           sigma_after_json          TEXT    NOT NULL,
+          generated_candidate_id    INTEGER,
+          generation_request_id     INTEGER,
+          prompt_policy_version_id  INTEGER,
           created_at                INTEGER NOT NULL,
           FOREIGN KEY(session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
         );
         """
     )
+    _migrate_question_performance_events_phase6(conn)
 
     # Phase 4: versioned question measurement parameters (w, noise_var, thresholds).
     # Each row is one immutable snapshot of a question's parameters at a point in time.
@@ -340,6 +378,7 @@ def init_db(conn: sqlite3.Connection) -> None:
 
     # Phase 5: one row per LLM candidate-generation event.
     # Links session → prompt policy → posterior context → rendered prompt → candidates.
+    # Phase 6: added status ('success'|'failed'|'skipped') and error_message for explicit failure logging.
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS llm_generation_requests (
@@ -359,12 +398,15 @@ def init_db(conn: sqlite3.Connection) -> None:
           model_name                   TEXT,
           n_requested                  INTEGER NOT NULL DEFAULT 0,
           n_returned                   INTEGER NOT NULL DEFAULT 0,
+          status                       TEXT    NOT NULL DEFAULT 'success',
+          error_message                TEXT,
           created_at                   INTEGER NOT NULL,
           FOREIGN KEY(session_id) REFERENCES sessions(session_id) ON DELETE CASCADE,
           FOREIGN KEY(prompt_policy_version_id) REFERENCES prompt_policy_versions(id)
         );
         """
     )
+    _migrate_llm_generation_requests_phase6(conn)
 
     # Phase 3: per-session metadata for every raw LLM-generated candidate question.
     # Phase 5 adds generation_request_id and prompt_policy_version_id for full lineage.
@@ -986,6 +1028,7 @@ def list_sessions_for_user(conn: sqlite3.Connection, user_id: str) -> List[Dict[
 # ---------------------------------------------------------------------------
 
 def _qpe_row_to_dict(r) -> Dict[str, Any]:
+    keys = r.keys() if hasattr(r, "keys") else []
     return {
         "id": int(r["id"]),
         "question_id": r["question_id"],
@@ -1007,6 +1050,21 @@ def _qpe_row_to_dict(r) -> Dict[str, Any]:
         "sigma_before": list(_loads(r["sigma_before_json"], [])),
         "mu_after": list(_loads(r["mu_after_json"], [])),
         "sigma_after": list(_loads(r["sigma_after_json"], [])),
+        "generated_candidate_id": (
+            int(r["generated_candidate_id"])
+            if "generated_candidate_id" in keys and r["generated_candidate_id"] is not None
+            else None
+        ),
+        "generation_request_id": (
+            int(r["generation_request_id"])
+            if "generation_request_id" in keys and r["generation_request_id"] is not None
+            else None
+        ),
+        "prompt_policy_version_id": (
+            int(r["prompt_policy_version_id"])
+            if "prompt_policy_version_id" in keys and r["prompt_policy_version_id"] is not None
+            else None
+        ),
         "created_at": int(r["created_at"]),
     }
 
@@ -1029,6 +1087,9 @@ def insert_question_performance_event(
     sigma_before: Sequence[Sequence[float]],
     mu_after: Sequence[float],
     sigma_after: Sequence[Sequence[float]],
+    generated_candidate_id: Optional[int] = None,
+    generation_request_id: Optional[int] = None,
+    prompt_policy_version_id: Optional[int] = None,
 ) -> None:
     conn.execute(
         """
@@ -1038,8 +1099,9 @@ def insert_question_performance_event(
             predicted_eig, entropy_before, entropy_after, realized_information_gain,
             response_value,
             mu_before_json, sigma_before_json, mu_after_json, sigma_after_json,
+            generated_candidate_id, generation_request_id, prompt_policy_version_id,
             created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
         """,
         (
             question_id,
@@ -1057,6 +1119,9 @@ def insert_question_performance_event(
             _dumps([list(r) for r in sigma_before]),
             _dumps(list(mu_after)),
             _dumps([list(r) for r in sigma_after]),
+            int(generated_candidate_id) if generated_candidate_id is not None else None,
+            int(generation_request_id) if generation_request_id is not None else None,
+            int(prompt_policy_version_id) if prompt_policy_version_id is not None else None,
             _utc_ts(),
         ),
     )
@@ -1515,6 +1580,8 @@ def insert_llm_generation_request(
     model_name: Optional[str],
     n_requested: int,
     n_returned: int,
+    status: str = "success",
+    error_message: Optional[str] = None,
 ) -> int:
     """Insert one LLM generation event and return its row id."""
     conn.execute(
@@ -1524,8 +1591,9 @@ def insert_llm_generation_request(
           posterior_mu_json, posterior_sigma_json, entropy_before,
           uncertainty_summary_json, question_history_summary_json,
           answer_history_summary_json, unresolved_tensions_json,
-          prompt_rendered, model_name, n_requested, n_returned, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+          prompt_rendered, model_name, n_requested, n_returned,
+          status, error_message, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
         """,
         (
             session_id,
@@ -1543,6 +1611,8 @@ def insert_llm_generation_request(
             model_name,
             int(n_requested),
             int(n_returned),
+            str(status),
+            error_message,
             _utc_ts(),
         ),
     )
@@ -1560,7 +1630,8 @@ def list_llm_generation_requests_for_session(
                posterior_mu_json, posterior_sigma_json, entropy_before,
                uncertainty_summary_json, question_history_summary_json,
                answer_history_summary_json, unresolved_tensions_json,
-               prompt_rendered, model_name, n_requested, n_returned, created_at
+               prompt_rendered, model_name, n_requested, n_returned,
+               status, error_message, created_at
         FROM llm_generation_requests
         WHERE session_id = ?
         ORDER BY id ASC;
@@ -1589,8 +1660,40 @@ def list_llm_generation_requests_for_session(
             "model_name": r["model_name"],
             "n_requested": int(r["n_requested"]),
             "n_returned": int(r["n_returned"]),
+            "status": r["status"] if "status" in r.keys() else "success",
+            "error_message": r["error_message"] if "error_message" in r.keys() else None,
             "created_at": int(r["created_at"]),
         }
         for r in rows
     ]
+
+
+def get_generated_candidate_for_session_question(
+    conn: sqlite3.Connection,
+    session_id: str,
+    question_id: str,
+) -> Optional[Dict[str, Any]]:
+    """Return the generated_question_candidates row for (session_id, question_id), or None."""
+    row = conn.execute(
+        """
+        SELECT id, generation_request_id, prompt_policy_version_id
+        FROM generated_question_candidates
+        WHERE session_id = ? AND question_id = ?
+        LIMIT 1;
+        """,
+        (session_id, question_id),
+    ).fetchone()
+    if row is None:
+        return None
+    return {
+        "id": int(row["id"]),
+        "generation_request_id": (
+            int(row["generation_request_id"]) if row["generation_request_id"] is not None else None
+        ),
+        "prompt_policy_version_id": (
+            int(row["prompt_policy_version_id"])
+            if row["prompt_policy_version_id"] is not None
+            else None
+        ),
+    }
 

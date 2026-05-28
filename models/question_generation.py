@@ -214,7 +214,9 @@ class AnthropicLLMClient:
     which can be overridden via the ``LLM_MODEL`` environment variable.
     """
 
-    def __init__(self, api_key: str, model: str = DEFAULT_LLM_MODEL) -> None:
+    DEFAULT_TIMEOUT = 30.0  # seconds; prevents hanging requests from blocking session creation
+
+    def __init__(self, api_key: str, model: str = DEFAULT_LLM_MODEL, timeout: float = DEFAULT_TIMEOUT) -> None:
         try:
             import anthropic as _anthropic  # local import keeps dependency optional
         except ImportError as exc:
@@ -222,16 +224,21 @@ class AnthropicLLMClient:
                 "The 'anthropic' package is required for AnthropicLLMClient. "
                 "Install it with: pip install anthropic"
             ) from exc
-        self._client = _anthropic.Anthropic(api_key=api_key)
+        self._client = _anthropic.Anthropic(api_key=api_key, timeout=timeout)
         self._model = model
 
     def complete(self, prompt: str) -> str:
-        msg = self._client.messages.create(
-            model=self._model,
-            max_tokens=1024,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        return msg.content[0].text
+        try:
+            msg = self._client.messages.create(
+                model=self._model,
+                max_tokens=1024,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            return msg.content[0].text
+        except Exception as exc:
+            raise RuntimeError(
+                f"Anthropic API call failed ({type(exc).__name__}): {exc}"
+            ) from exc
 
 
 def make_llm_client(

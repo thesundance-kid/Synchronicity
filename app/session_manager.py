@@ -30,6 +30,38 @@ Mode = Literal["adaptive", "fixed_order"]
 Status = Literal["inference", "heldout", "complete"]
 
 
+class _AtomicConn:
+    """
+    Proxy a sqlite3.Connection so that all commit() calls are deferred until __exit__.
+    On success, issues a single real commit. On exception, issues rollback.
+    Use as a context manager inside record_answer to make all DB writes for one
+    answer atomic: no partial state is committed if posterior update or event
+    logging fails mid-operation.
+    """
+
+    def __init__(self, conn) -> None:
+        self._conn = conn
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if exc_type is None:
+            self._conn.commit()
+        else:
+            self._conn.rollback()
+        return False  # do not suppress exceptions
+
+    def commit(self) -> None:
+        pass  # deferred — real commit happens in __exit__
+
+    def rollback(self) -> None:
+        self._conn.rollback()
+
+    def __getattr__(self, name: str):
+        return getattr(self._conn, name)
+
+
 @dataclass(frozen=True)
 class QuestionPayload:
     id: str
@@ -243,6 +275,10 @@ def create_session(
     policy_version_id: Optional[int] = None
     n_returned: int = 0
 
+    # Phase 6: explicit generation status/error for llm_generation_requests logging.
+    generation_status: str = "success"
+    generation_error: Optional[str] = None
+
     if use_generated:
         _policy_row = db.get_active_prompt_policy_version(conn)
         if _policy_row is not None:
@@ -277,6 +313,16 @@ def create_session(
             generated_stored = None
             generated_candidates_metadata = None
             n_returned = 0
+            generation_status = "failed"
+            # Truncate to avoid storing stack traces or sensitive strings.
+            generation_error = str(exc)[:500]
+
+    # Phase 6: freeze the active parameter version for each seed question at session creation
+    # time. This prevents scientific drift if a new parameter version is activated mid-session;
+    # record_answer will use the version captured here rather than the current active one.
+    for d in seed_stored:
+        _pv = db.get_active_question_parameter_version(conn, d["id"])
+        d["param_version"] = _pv["version"] if _pv is not None else None
 
     final_inference_dicts = build_session_inference_pool(seed_stored, generated_stored if use_generated else None)
     inference_ids = {d["id"] for d in final_inference_dicts}
@@ -372,6 +418,8 @@ def create_session(
                 model_name=llm_model or DEFAULT_LLM_MODEL,
                 n_requested=n_generation_candidates,
                 n_returned=n_returned,
+                status=generation_status,
+                error_message=generation_error,
             )
         except Exception as exc:  # noqa: BLE001
             import warnings
@@ -491,8 +539,28 @@ def record_answer(
 
     Returns a dict payload suitable for API responses:
       - {"status": "inference"|"heldout"|"complete", "next_question": {...}|None}
+
+    Phase 6 guarantees:
+    - Only the currently pending question is accepted (no skipping ahead).
+    - All DB writes are wrapped in a single atomic transaction; if any step fails
+      (including the posterior update), the entire answer is rolled back.
     """
     sess = db.get_session(conn, session_id)
+
+    # Phase 6: pending-question validation — reject stale or out-of-order answers.
+    if sess.status == "complete":
+        raise ValueError("Session is already complete. No further answers are accepted.")
+    if sess.pending_question_id is None:
+        raise ValueError(
+            "No pending question for this session. Call /next_question first."
+        )
+    if question_id != sess.pending_question_id:
+        raise ValueError(
+            f"question_id '{question_id}' is not the currently pending question "
+            f"(expected '{sess.pending_question_id}'). "
+            "Submit answers only for the currently issued question; do not skip ahead."
+        )
+
     inference_questions = _session_inference_questions(sess, questions_v2_path, dim)
     qmap = _qmap_with_session_inference(sess, questions_v2_path, dim)
 
@@ -507,7 +575,8 @@ def record_answer(
     inference_ids = {qq.id for qq in inference_questions}
     pool: Literal["inference", "heldout"] = "inference" if question_id in inference_ids else "heldout"
 
-    # Prevent answering out-of-phase heldout items during inference unless requested.
+    # Cross-phase guard: pending_question_id should never point at a heldout item during
+    # inference, but guard defensively in case of data corruption.
     if sess.status == "inference" and pool == "heldout":
         raise ValueError("Cannot answer held-out items while still in inference phase.")
 
@@ -525,119 +594,149 @@ def record_answer(
 
     src = _question_source(question_id, sess)
 
-    # Write response first (so it's always logged, even if update fails later).
-    db.insert_response(
-        conn,
-        session_id=session_id,
-        question_id=question_id,
-        pool=pool,
-        step=sess.step if pool == "inference" else sess.step,
-        response=int(response),
-    )
-
-    if pool == "inference":
-        # Update posterior snapshot.
-        state_pre.update_posterior_likert_laplace(
-            w=q.w,
-            y=int(response),
-            thresholds=q.thresholds,
-            noise_var=float(q.noise_var),
-        )
-        entropy_after = float(state_pre.entropy())
-        mu, sigma = _state_to_jsonable(state_pre)
-
-        asked_ids = list(sess.asked_ids)
-        if question_id not in asked_ids:
-            asked_ids.append(question_id)
-
-        next_step = int(sess.step) + 1
-        next_status: Status = sess.status
-        if next_step >= sess.max_inference_questions:
-            next_status = "heldout"
-
-        db.update_session_state(
-            conn,
+    # Phase 6: atomic transaction — all DB writes for this answer succeed or all roll back.
+    # _AtomicConn defers conn.commit() calls to a single commit at __exit__, rolling back
+    # on any exception (including a failed posterior update).
+    with _AtomicConn(conn) as txn:
+        db.insert_response(
+            txn,
             session_id=session_id,
-            status=next_status,
-            step=next_step,
-            asked_ids=asked_ids,
-            posterior_mu=mu,
-            posterior_sigma=sigma,
+            question_id=question_id,
+            pool=pool,
+            step=sess.step,
+            response=int(response),
         )
 
-        # Phase 1: per-step snapshot and longitudinal user state.
-        db.insert_posterior_snapshot(
-            conn,
-            session_id=session_id,
-            step_idx=next_step,
-            mu=mu,
-            sigma=sigma,
-            entropy=entropy_after,
-        )
-        if sess.user_id is not None:
-            db.upsert_user_current_state(
-                conn,
-                user_id=sess.user_id,
-                latest_session_id=session_id,
-                latest_step_idx=next_step,
+        if pool == "inference":
+            # Posterior update — may raise on numerical failure; rolls back insert_response.
+            state_pre.update_posterior_likert_laplace(
+                w=q.w,
+                y=int(response),
+                thresholds=q.thresholds,
+                noise_var=float(q.noise_var),
+            )
+            entropy_after = float(state_pre.entropy())
+            mu, sigma = _state_to_jsonable(state_pre)
+
+            asked_ids = list(sess.asked_ids)
+            if question_id not in asked_ids:
+                asked_ids.append(question_id)
+
+            next_step = int(sess.step) + 1
+            next_status: Status = sess.status
+            if next_step >= sess.max_inference_questions:
+                next_status = "heldout"
+
+            db.update_session_state(
+                txn,
+                session_id=session_id,
+                status=next_status,
+                step=next_step,
+                asked_ids=asked_ids,
+                posterior_mu=mu,
+                posterior_sigma=sigma,
+            )
+
+            # Phase 1: per-step snapshot and longitudinal user state.
+            db.insert_posterior_snapshot(
+                txn,
+                session_id=session_id,
+                step_idx=next_step,
                 mu=mu,
                 sigma=sigma,
                 entropy=entropy_after,
             )
+            if sess.user_id is not None:
+                db.upsert_user_current_state(
+                    txn,
+                    user_id=sess.user_id,
+                    latest_session_id=session_id,
+                    latest_step_idx=next_step,
+                    mu=mu,
+                    sigma=sigma,
+                    entropy=entropy_after,
+                )
 
-        # Phase 2: record per-answer learning signal (inference only).
-        # sess.posterior_mu/sigma are the frozen pre-update values from the SessionRow.
-        # Phase 4: look up the active parameter version for this question (None for generated).
-        _pv = db.get_active_question_parameter_version(conn, question_id)
-        parameter_version = _pv["version"] if _pv is not None else None
-        db.insert_question_performance_event(
-            conn,
-            question_id=question_id,
+            # Phase 4+6: use the parameter version frozen at session creation, not the
+            # currently active version. This prevents scientific drift when parameters are
+            # re-estimated after the session pool was built.
+            pool_param_version: Optional[int] = None
+            if sess.inference_pool:
+                for _d in sess.inference_pool:
+                    if str(_d.get("id")) == question_id:
+                        pool_param_version = _d.get("param_version")
+                        break
+
+            # Phase 6: direct lineage — resolve generated_candidate_id and linked request/policy.
+            generated_candidate_id: Optional[int] = None
+            gen_cand_request_id: Optional[int] = None
+            gen_cand_policy_version_id: Optional[int] = None
+            if src == "generated":
+                _gen_cand = db.get_generated_candidate_for_session_question(
+                    txn, session_id, question_id
+                )
+                if _gen_cand is not None:
+                    generated_candidate_id = _gen_cand["id"]
+                    gen_cand_request_id = _gen_cand.get("generation_request_id")
+                    gen_cand_policy_version_id = _gen_cand.get("prompt_policy_version_id")
+
+            # Phase 2+6: performance event with direct lineage fields.
+            db.insert_question_performance_event(
+                txn,
+                question_id=question_id,
+                session_id=session_id,
+                user_id=sess.user_id,
+                step_idx=step_idx,
+                question_source=src,
+                parameter_version=pool_param_version,
+                predicted_eig=eig_at,
+                entropy_before=entropy_before,
+                entropy_after=entropy_after,
+                realized_information_gain=entropy_before - entropy_after,
+                response_value=int(response),
+                mu_before=sess.posterior_mu,
+                sigma_before=sess.posterior_sigma,
+                mu_after=mu,
+                sigma_after=sigma,
+                generated_candidate_id=generated_candidate_id,
+                generation_request_id=gen_cand_request_id,
+                prompt_policy_version_id=gen_cand_policy_version_id,
+            )
+
+            # Phase 3: mark generated question as selected at this step.
+            if src == "generated":
+                try:
+                    db.update_generated_candidate_selected_at_step(
+                        txn,
+                        session_id=session_id,
+                        question_id=question_id,
+                        selected_at_step=step_idx,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    import warnings
+                    warnings.warn(
+                        f"Failed to update generated candidate selected_at_step: {exc}",
+                        stacklevel=2,
+                    )
+        else:
+            entropy_after = entropy_before
+
+        db.insert_step_log(
+            txn,
             session_id=session_id,
-            user_id=sess.user_id,
             step_idx=step_idx,
-            question_source=src,
-            parameter_version=parameter_version,
-            predicted_eig=eig_at,
+            question_id=question_id,
+            source=src,
+            response=int(response),
+            eig_at_selection=eig_at,
             entropy_before=entropy_before,
             entropy_after=entropy_after,
-            realized_information_gain=entropy_before - entropy_after,
-            response_value=int(response),
-            mu_before=sess.posterior_mu,
-            sigma_before=sess.posterior_sigma,
-            mu_after=mu,
-            sigma_after=sigma,
         )
+        db.clear_pending_selection(txn, session_id=session_id)
+    # End of atomic block — conn.commit() issued here on success, rollback on exception.
 
-        # Phase 3: mark generated question as selected at this step.
-        if src == "generated":
-            try:
-                db.update_generated_candidate_selected_at_step(
-                    conn,
-                    session_id=session_id,
-                    question_id=question_id,
-                    selected_at_step=step_idx,
-                )
-            except Exception as exc:  # noqa: BLE001
-                import warnings
-                warnings.warn(f"Failed to update generated candidate selected_at_step: {exc}", stacklevel=2)
-    else:
-        entropy_after = entropy_before
-
-    db.insert_step_log(
-        conn,
-        session_id=session_id,
-        step_idx=step_idx,
-        question_id=question_id,
-        source=src,
-        response=int(response),
-        eig_at_selection=eig_at,
-        entropy_before=entropy_before,
-        entropy_after=entropy_after,
-    )
-    db.clear_pending_selection(conn, session_id=session_id)
-
-    # Held-out answers do not update posterior; we just advance via get_next_question().
+    # Post-commit: advance to the next question (sets new pending_question_id) and finalize
+    # heldout evaluation if the session just completed.
     next_q = get_next_question(conn, questions_v2_path=questions_v2_path, session_id=session_id, dim=dim)
     sess2 = db.get_session(conn, session_id)
     if sess2.status == "complete":
