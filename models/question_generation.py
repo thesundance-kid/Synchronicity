@@ -7,6 +7,7 @@ Swap in any client that implements ``LLMClient`` (``complete(prompt) -> str``).
 from __future__ import annotations
 
 import re
+import json
 from typing import List, Protocol, Tuple, runtime_checkable
 
 import numpy as np
@@ -122,21 +123,53 @@ Seed questions (do not repeat or closely mimic these):
 {seeds_block}
 
 Output format:
-- Number each line starting with the number, a period, and a space (e.g. "1. ...", "2. ...").
-- Output only the numbered list, no other commentary.
+Return only a JSON array. Each item must have:
+- "text": the question text
+- "intended_contrast": what profiles this item is meant to distinguish
+- "expected_response_pattern": how those profiles should differ
+- "risk_notes": brief safety/neutrality note
+- "suggested_traits": optional list of trait names involved
 """
 
 
 def parse_candidate_output(raw_text: str) -> List[dict]:
     """
-    Parse model output assumed to be a numbered list into ``[{{"text": "..."}}, ...]``.
+    Parse model output into candidate dicts.
 
+    Structured JSON arrays are preferred. Numbered-list output remains supported
+    for deterministic dummy clients and older prompt policies.
     Lines like ``1. I enjoy ...`` or ``2) I prefer ...`` are recognized.
     """
     if not raw_text or not raw_text.strip():
         return []
 
-    lines = raw_text.strip().splitlines()
+    raw = raw_text.strip()
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, dict) and isinstance(parsed.get("questions"), list):
+            parsed = parsed["questions"]
+        if isinstance(parsed, list):
+            items = []
+            for row in parsed:
+                if isinstance(row, str):
+                    text = row.strip()
+                    if text:
+                        items.append({"text": text})
+                elif isinstance(row, dict):
+                    text = str(row.get("text") or row.get("question") or "").strip()
+                    if text:
+                        items.append({
+                            "text": text,
+                            "intended_contrast": row.get("intended_contrast"),
+                            "expected_response_pattern": row.get("expected_response_pattern"),
+                            "risk_notes": row.get("risk_notes"),
+                            "suggested_traits": row.get("suggested_traits") or row.get("llm_suggested_traits"),
+                        })
+            return items
+    except json.JSONDecodeError:
+        pass
+
+    lines = raw.splitlines()
     items: List[dict] = []
     # Match start of line: optional whitespace, digits, then . or ), then space
     pattern = re.compile(r"^\s*(\d+)\s*[\.)]\s*(.+)$")

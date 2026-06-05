@@ -21,6 +21,7 @@ from models.question_bank import DEFAULT_THRESHOLDS, Question, load_question_poo
 from models.prompt_policy import PromptPolicy, render_prompt_policy
 from models.question_generation import DEFAULT_LLM_MODEL, make_llm_client
 from models.question_pool_builder import build_generated_pool, build_session_inference_pool
+from models.question_scoring import SessionComposition, select_next_question_exploratory
 from models.question_selection import expected_information_gain, select_next_question_eig
 from models.real_eval import evaluate_heldout_performance
 from models.session_experiment import assign_experiment_arm, should_use_generated_questions
@@ -28,6 +29,7 @@ from models.session_experiment import assign_experiment_arm, should_use_generate
 
 Mode = Literal["adaptive", "fixed_order"]
 Status = Literal["inference", "heldout", "complete"]
+SessionStrategy = Literal["classic_eig", "anchored_exploratory"]
 
 
 class _AtomicConn:
@@ -92,6 +94,8 @@ def _question_to_stored_dict(q: Question) -> Dict[str, Any]:
         "w": q.w.astype(float).tolist(),
         "noise_var": float(q.noise_var),
         "thresholds": q.thresholds.astype(float).tolist(),
+        "source": "seed",
+        "calibration_status": "calibrated",
     }
 
 
@@ -136,6 +140,20 @@ def _question_source(question_id: str, sess: db.SessionRow) -> Literal["seed", "
     if question_id in set(sess.generated_question_ids):
         return "generated"
     return "seed"
+
+
+def _session_question_metadata(sess: db.SessionRow) -> Dict[str, Dict[str, Any]]:
+    metadata: Dict[str, Dict[str, Any]] = {}
+    if sess.inference_pool:
+        for d in sess.inference_pool:
+            qid = str(d.get("id"))
+            metadata[qid] = {
+                "source": d.get("source"),
+                "calibration_status": d.get("calibration_status"),
+                "policy_quality_prior": d.get("policy_quality_prior", 0.0),
+                "risk_penalty": d.get("risk_penalty", 0.0),
+            }
+    return metadata
 
 
 def _qmap_with_session_inference(sess: db.SessionRow, questions_v2_path: str, dim: int) -> Dict[str, Question]:
@@ -234,6 +252,9 @@ def create_session(
     n_generation_candidates: int = 10,
     nn_k: int = 3,
     user_id: Optional[str] = None,
+    session_strategy: SessionStrategy = "classic_eig",
+    max_anchor_questions: int = 2,
+    max_generated_probes: int = 6,
 ) -> Tuple[str, QuestionPayload]:
     """
     Create a new session and return (session_id, first_question_payload).
@@ -265,7 +286,7 @@ def create_session(
     seed_stored = [_question_to_stored_dict(q) for q in inference_seed]
     seeds_for_generation = [{"id": q.id, "text": q.text, "w": q.w} for q in inference_seed]
 
-    use_generated = should_use_generated_questions(arm)
+    use_generated = should_use_generated_questions(arm) or session_strategy == "anchored_exploratory"
     generated_stored: Optional[List[Dict[str, Any]]] = None
     generated_candidates_metadata: Optional[List[Dict[str, Any]]] = None
 
@@ -287,6 +308,7 @@ def create_session(
                 PromptPolicy.from_row(_policy_row),
                 seeds_for_generation,
                 n_generation_candidates,
+                uncertainty_summary=None,
             )
 
         if llm_client is not None:
@@ -302,6 +324,10 @@ def create_session(
                 prompt=rendered_prompt,
             )
             generated_stored = [_jsonable_question_dict(x) for x in gen_result.accepted]
+            for d in generated_stored:
+                d["source"] = "generated"
+                d["param_version"] = None
+                d["calibration_status"] = str(d.get("calibration_status") or "accepted_uncalibrated")
             generated_candidates_metadata = gen_result.all_candidates_metadata
             n_returned = len(generated_candidates_metadata)
         except Exception as exc:  # noqa: BLE001
@@ -324,7 +350,18 @@ def create_session(
         _pv = db.get_active_question_parameter_version(conn, d["id"])
         d["param_version"] = _pv["version"] if _pv is not None else None
 
+    n_gen = len(generated_stored) if generated_stored else 0
+    gen_qids = [str(d["id"]) for d in generated_stored] if generated_stored else []
+
     final_inference_dicts = build_session_inference_pool(seed_stored, generated_stored if use_generated else None)
+    for d in final_inference_dicts:
+        d.setdefault("source", "generated" if str(d.get("id")) in set(gen_qids) else "seed")
+        d.setdefault("calibration_status", "accepted_uncalibrated" if d.get("source") == "generated" else "calibrated")
+    if session_strategy == "anchored_exploratory":
+        for d in final_inference_dicts:
+            d["session_strategy"] = session_strategy
+            d["min_anchor_questions"] = int(max_anchor_questions)
+            d["max_generated_probes"] = int(max_generated_probes)
     inference_ids = {d["id"] for d in final_inference_dicts}
 
     if mode == "fixed_order":
@@ -355,9 +392,6 @@ def create_session(
 
     mu, sigma = _state_to_jsonable(state)
     initial_entropy = float(state.entropy())
-
-    n_gen = len(generated_stored) if generated_stored else 0
-    gen_qids = [str(d["id"]) for d in generated_stored] if generated_stored else []
 
     db.insert_session(
         conn,
@@ -449,6 +483,15 @@ def create_session(
                     nn_similarities=meta.get("nn_similarities"),
                     generation_request_id=gen_request_id,
                     prompt_policy_version_id=policy_version_id,
+                    embedding_model=meta.get("embedding_model"),
+                    embedding_ref=meta.get("embedding_ref"),
+                    intended_contrast=meta.get("intended_contrast"),
+                    llm_suggested_traits=meta.get("llm_suggested_traits"),
+                    expected_response_pattern=meta.get("expected_response_pattern"),
+                    risk_notes=meta.get("risk_notes"),
+                    provisional_w_source=meta.get("provisional_w_source"),
+                    provisional_w_confidence=meta.get("provisional_w_confidence"),
+                    calibration_status=str(meta.get("calibration_status") or "candidate"),
                 )
             except Exception as exc:  # noqa: BLE001
                 import warnings
@@ -493,12 +536,59 @@ def get_next_question(
         else:
             state = _state_from_jsonable(sess.posterior_mu, sess.posterior_sigma)
             if sess.mode == "adaptive":
-                best, best_eig, _ = select_next_question_eig(state, inference_questions, asked_ids=asked)
+                strategy = "classic_eig"
+                min_anchor = 0
+                max_generated = len(inference_questions)
+                if sess.inference_pool:
+                    first = sess.inference_pool[0]
+                    strategy = str(first.get("session_strategy") or "classic_eig")
+                    min_anchor = int(first.get("min_anchor_questions") or 0)
+                    max_generated = int(first.get("max_generated_probes") or max_generated)
+
+                if strategy == "anchored_exploratory":
+                    best, best_score, ranked = select_next_question_exploratory(
+                        state,
+                        inference_questions,
+                        asked_ids=asked,
+                        generated_question_ids=set(sess.generated_question_ids),
+                        question_metadata=_session_question_metadata(sess),
+                        composition=SessionComposition.scaled(
+                            sess.max_inference_questions,
+                            min_anchor_questions=min_anchor or 2,
+                            max_generated_probes=max_generated,
+                        ),
+                    )
+                    best_eig = 0.0
+                    best_components: Dict[str, float] = {}
+                    if ranked:
+                        _, _, best_components = ranked[0]
+                        best_eig = float(best_components.get("expected_information_gain", best_score))
+                else:
+                    best, best_eig, _ = select_next_question_eig(state, inference_questions, asked_ids=asked)
+                    best_components = {
+                        "selection_score": float(best_eig),
+                        "expected_information_gain": float(best_eig),
+                        "semantic_novelty": 1.0,
+                        "exploration_bonus": 0.0,
+                        "policy_quality_prior": 0.0,
+                        "redundancy_penalty": 0.0,
+                        "risk_penalty": 0.0,
+                    }
                 if best is None:
                     db.update_session_state(conn, session_id=session_id, status="heldout")
                     return get_next_question(conn, questions_v2_path=questions_v2_path, session_id=session_id, dim=dim)
                 db.update_pending_selection(
                     conn, session_id=session_id, question_id=best.id, eig=float(best_eig)
+                )
+                db.insert_selection_score_log(
+                    conn,
+                    session_id=session_id,
+                    step_idx=sess.step,
+                    question_id=best.id,
+                    question_source=_question_source(best.id, sess),
+                    components=best_components,
+                    calibration_status=_session_question_metadata(sess).get(best.id, {}).get("calibration_status"),
+                    selected=True,
                 )
                 return _question_payload(best, pool="inference")
 
@@ -811,7 +901,9 @@ def get_session_summary(
         "n_generated_candidates": sess.n_generated_candidates,
         "generated_question_ids": sess.generated_question_ids,
         "step_logs": db.list_step_logs(conn, session_id),
+        "selection_score_logs": db.list_selection_score_logs(conn, session_id),
         "session_run_log": db.get_session_run_log(conn, session_id),
+        "generated_candidate_metadata": db.list_generated_question_candidates(conn, session_id),
         "responses": [
             {
                 "question_id": r.question_id,
@@ -825,4 +917,3 @@ def get_session_summary(
         "created_at": sess.created_at,
         "updated_at": sess.updated_at,
     }
-

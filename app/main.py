@@ -17,6 +17,7 @@ from __future__ import annotations
 import os
 import secrets
 import sqlite3
+from pathlib import Path
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException
@@ -35,10 +36,35 @@ from app.session_manager import (
 from models.prompt_policy import GENERIC_TEMPLATE
 
 
+def _load_local_env() -> None:
+    """
+    Load simple KEY=VALUE pairs from the project-root .env file if present.
+    Existing shell environment variables take precedence.
+    """
+    env_path = Path(__file__).resolve().parents[1] / ".env"
+    if not env_path.is_file():
+        return
+    for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export "):].strip()
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
 def _env(name: str, default: str) -> str:
     v = os.environ.get(name)
     return v if v is not None and v.strip() else default
 
+
+_load_local_env()
 
 DB_PATH = _env("PILOT_DB_PATH", os.path.join("data", "pilot.db"))
 QUESTIONS_PATH = _env("QUESTIONS_PATH", os.path.join("data", "questions_v2.json"))
@@ -69,15 +95,19 @@ def _startup() -> None:
     db.init_db(conn)
     db.seed_question_parameters(conn, QUESTIONS_PATH)
     db.seed_prompt_policies(conn, GENERIC_TEMPLATE)
+    db.seed_exploratory_prompt_policies(conn)
     conn.close()
 
 
 class StartSessionRequest(BaseModel):
     mode: Mode = Field(..., description='Session mode: "adaptive" or "fixed_order"')
-    max_inference_questions: int = Field(5, ge=1, le=50)
-    num_heldout: int = Field(5, ge=1, le=50)
+    max_inference_questions: int = Field(8, ge=1, le=50)
+    num_heldout: int = Field(2, ge=1, le=50)
     fixed_order_ids: Optional[list[str]] = None
     user_id: Optional[str] = None
+    session_strategy: str = Field("anchored_exploratory")
+    max_anchor_questions: int = Field(2, ge=1, le=8)
+    max_generated_probes: int = Field(6, ge=0, le=8)
 
 
 class QuestionModel(BaseModel):
@@ -97,6 +127,13 @@ def start_session(req: StartSessionRequest) -> StartSessionResponse:
     conn = db.connect(DB_PATH)
     db.init_db(conn)
     try:
+        if req.session_strategy == "anchored_exploratory" and (
+            req.max_inference_questions + req.num_heldout > 10
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail="anchored_exploratory sessions are capped at 10 total questions",
+            )
         # Reject a provided user_id that does not exist — do not silently treat it as anonymous.
         if req.user_id:
             user = db.get_user(conn, req.user_id)
@@ -113,6 +150,9 @@ def start_session(req: StartSessionRequest) -> StartSessionResponse:
             llm_api_key=ANTHROPIC_API_KEY or None,
             llm_model=LLM_MODEL or None,
             user_id=req.user_id or None,
+            session_strategy=req.session_strategy,
+            max_anchor_questions=req.max_anchor_questions,
+            max_generated_probes=req.max_generated_probes,
         )
         return StartSessionResponse(session_id=session_id, first_question=QuestionModel(**first_q.__dict__))
     except HTTPException:

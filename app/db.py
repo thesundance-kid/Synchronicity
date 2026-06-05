@@ -83,7 +83,7 @@ def connect(db_path: str) -> sqlite3.Connection:
 
 
 def _migrate_generated_candidates_phase5(conn: sqlite3.Connection) -> None:
-    """Add Phase 5 lineage columns to generated_question_candidates (idempotent)."""
+    """Add generated-candidate metadata columns (idempotent)."""
     info = conn.execute("PRAGMA table_info(generated_question_candidates);").fetchall()
     col_names = {row[1] for row in info}
     if "generation_request_id" not in col_names:
@@ -93,6 +93,26 @@ def _migrate_generated_candidates_phase5(conn: sqlite3.Connection) -> None:
     if "prompt_policy_version_id" not in col_names:
         conn.execute(
             "ALTER TABLE generated_question_candidates ADD COLUMN prompt_policy_version_id INTEGER;"
+        )
+    if "embedding_model" not in col_names:
+        conn.execute("ALTER TABLE generated_question_candidates ADD COLUMN embedding_model TEXT;")
+    if "embedding_ref" not in col_names:
+        conn.execute("ALTER TABLE generated_question_candidates ADD COLUMN embedding_ref TEXT;")
+    if "intended_contrast_json" not in col_names:
+        conn.execute("ALTER TABLE generated_question_candidates ADD COLUMN intended_contrast_json TEXT;")
+    if "llm_suggested_traits_json" not in col_names:
+        conn.execute("ALTER TABLE generated_question_candidates ADD COLUMN llm_suggested_traits_json TEXT;")
+    if "expected_response_pattern" not in col_names:
+        conn.execute("ALTER TABLE generated_question_candidates ADD COLUMN expected_response_pattern TEXT;")
+    if "risk_notes" not in col_names:
+        conn.execute("ALTER TABLE generated_question_candidates ADD COLUMN risk_notes TEXT;")
+    if "provisional_w_source" not in col_names:
+        conn.execute("ALTER TABLE generated_question_candidates ADD COLUMN provisional_w_source TEXT;")
+    if "provisional_w_confidence" not in col_names:
+        conn.execute("ALTER TABLE generated_question_candidates ADD COLUMN provisional_w_confidence REAL;")
+    if "calibration_status" not in col_names:
+        conn.execute(
+            "ALTER TABLE generated_question_candidates ADD COLUMN calibration_status TEXT NOT NULL DEFAULT 'candidate';"
         )
 
 
@@ -225,6 +245,28 @@ def init_db(conn: sqlite3.Connection) -> None:
     )
     conn.execute(
         """
+        CREATE TABLE IF NOT EXISTS selection_score_logs (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          session_id TEXT NOT NULL,
+          step_idx INTEGER NOT NULL,
+          question_id TEXT NOT NULL,
+          question_source TEXT NOT NULL,
+          selection_score REAL NOT NULL,
+          expected_information_gain REAL,
+          semantic_novelty REAL,
+          exploration_bonus REAL,
+          policy_quality_prior REAL,
+          redundancy_penalty REAL,
+          risk_penalty REAL,
+          calibration_status TEXT,
+          selected INTEGER NOT NULL DEFAULT 1,
+          created_at INTEGER NOT NULL,
+          FOREIGN KEY(session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
+        );
+        """
+    )
+    conn.execute(
+        """
         CREATE TABLE IF NOT EXISTS session_run_logs (
           session_id TEXT PRIMARY KEY,
           arm TEXT NOT NULL,
@@ -327,6 +369,15 @@ def init_db(conn: sqlite3.Connection) -> None:
           generated_candidate_id    INTEGER,
           generation_request_id     INTEGER,
           prompt_policy_version_id  INTEGER,
+          embedding_model           TEXT,
+          embedding_ref             TEXT,
+          intended_contrast_json    TEXT,
+          llm_suggested_traits_json TEXT,
+          expected_response_pattern TEXT,
+          risk_notes                TEXT,
+          provisional_w_source      TEXT,
+          provisional_w_confidence  REAL,
+          calibration_status        TEXT NOT NULL DEFAULT 'candidate',
           created_at                INTEGER NOT NULL,
           FOREIGN KEY(session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
         );
@@ -441,6 +492,37 @@ def init_db(conn: sqlite3.Connection) -> None:
         """
     )
     _migrate_generated_candidates_phase5(conn)
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS question_calibration_runs (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          question_id TEXT NOT NULL,
+          status TEXT NOT NULL,
+          n_responses INTEGER NOT NULL,
+          old_version INTEGER,
+          new_version INTEGER,
+          active_promoted INTEGER NOT NULL DEFAULT 0,
+          method TEXT NOT NULL,
+          diagnostics_json TEXT,
+          created_at INTEGER NOT NULL
+        );
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS prompt_policy_scores (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          prompt_policy_version_id INTEGER NOT NULL,
+          n_requests INTEGER NOT NULL DEFAULT 0,
+          n_candidates INTEGER NOT NULL DEFAULT 0,
+          n_selected INTEGER NOT NULL DEFAULT 0,
+          reward_score REAL NOT NULL,
+          metrics_json TEXT NOT NULL,
+          created_at INTEGER NOT NULL,
+          FOREIGN KEY(prompt_policy_version_id) REFERENCES prompt_policy_versions(id)
+        );
+        """
+    )
     conn.commit()
 
 
@@ -635,6 +717,76 @@ def insert_step_log(
         ),
     )
     conn.commit()
+
+
+def insert_selection_score_log(
+    conn: sqlite3.Connection,
+    *,
+    session_id: str,
+    step_idx: int,
+    question_id: str,
+    question_source: str,
+    components: Dict[str, Any],
+    calibration_status: Optional[str] = None,
+    selected: bool = True,
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO selection_score_logs (
+          session_id, step_idx, question_id, question_source,
+          selection_score, expected_information_gain, semantic_novelty,
+          exploration_bonus, policy_quality_prior, redundancy_penalty,
+          risk_penalty, calibration_status, selected, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+        """,
+        (
+            session_id,
+            int(step_idx),
+            question_id,
+            question_source,
+            float(components.get("selection_score", 0.0)),
+            float(components["expected_information_gain"]) if components.get("expected_information_gain") is not None else None,
+            float(components["semantic_novelty"]) if components.get("semantic_novelty") is not None else None,
+            float(components.get("exploration_bonus", 0.0)),
+            float(components.get("policy_quality_prior", 0.0)),
+            float(components.get("redundancy_penalty", 0.0)),
+            float(components.get("risk_penalty", 0.0)),
+            calibration_status,
+            1 if selected else 0,
+            _utc_ts(),
+        ),
+    )
+    conn.commit()
+
+
+def list_selection_score_logs(conn: sqlite3.Connection, session_id: str) -> List[Dict[str, Any]]:
+    rows = conn.execute(
+        """
+        SELECT * FROM selection_score_logs
+        WHERE session_id = ?
+        ORDER BY step_idx ASC, id ASC;
+        """,
+        (session_id,),
+    ).fetchall()
+    return [
+        {
+            "session_id": r["session_id"],
+            "step_idx": int(r["step_idx"]),
+            "question_id": r["question_id"],
+            "question_source": r["question_source"],
+            "selection_score": float(r["selection_score"]),
+            "expected_information_gain": float(r["expected_information_gain"]) if r["expected_information_gain"] is not None else None,
+            "semantic_novelty": float(r["semantic_novelty"]) if r["semantic_novelty"] is not None else None,
+            "exploration_bonus": float(r["exploration_bonus"]) if r["exploration_bonus"] is not None else None,
+            "policy_quality_prior": float(r["policy_quality_prior"]) if r["policy_quality_prior"] is not None else None,
+            "redundancy_penalty": float(r["redundancy_penalty"]) if r["redundancy_penalty"] is not None else None,
+            "risk_penalty": float(r["risk_penalty"]) if r["risk_penalty"] is not None else None,
+            "calibration_status": r["calibration_status"],
+            "selected": bool(r["selected"]),
+            "created_at": int(r["created_at"]),
+        }
+        for r in rows
+    ]
 
 
 def insert_session_run_log(
@@ -1180,6 +1332,15 @@ def insert_generated_question_candidate(
     nn_similarities: Optional[Sequence[float]],
     generation_request_id: Optional[int] = None,
     prompt_policy_version_id: Optional[int] = None,
+    embedding_model: Optional[str] = None,
+    embedding_ref: Optional[str] = None,
+    intended_contrast: Optional[Any] = None,
+    llm_suggested_traits: Optional[Any] = None,
+    expected_response_pattern: Optional[str] = None,
+    risk_notes: Optional[str] = None,
+    provisional_w_source: Optional[str] = None,
+    provisional_w_confidence: Optional[float] = None,
+    calibration_status: str = "candidate",
 ) -> None:
     conn.execute(
         """
@@ -1192,8 +1353,11 @@ def insert_generated_question_candidate(
           nn_seed_ids_json, nn_similarities_json,
           selected_at_step,
           generation_request_id, prompt_policy_version_id,
+          embedding_model, embedding_ref, intended_contrast_json,
+          llm_suggested_traits_json, expected_response_pattern, risk_notes,
+          provisional_w_source, provisional_w_confidence, calibration_status,
           created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
         """,
         (
             session_id,
@@ -1214,6 +1378,15 @@ def insert_generated_question_candidate(
             None,  # selected_at_step starts NULL
             int(generation_request_id) if generation_request_id is not None else None,
             int(prompt_policy_version_id) if prompt_policy_version_id is not None else None,
+            embedding_model,
+            embedding_ref,
+            _dumps(intended_contrast) if intended_contrast is not None else None,
+            _dumps(llm_suggested_traits) if llm_suggested_traits is not None else None,
+            expected_response_pattern,
+            risk_notes,
+            provisional_w_source,
+            float(provisional_w_confidence) if provisional_w_confidence is not None else None,
+            calibration_status,
             _utc_ts(),
         ),
     )
@@ -1251,6 +1424,9 @@ def list_generated_question_candidates(
                nn_seed_ids_json, nn_similarities_json,
                selected_at_step,
                generation_request_id, prompt_policy_version_id,
+               embedding_model, embedding_ref, intended_contrast_json,
+               llm_suggested_traits_json, expected_response_pattern, risk_notes,
+               provisional_w_source, provisional_w_confidence, calibration_status,
                created_at
         FROM generated_question_candidates
         WHERE session_id = ?
@@ -1291,6 +1467,17 @@ def list_generated_question_candidates(
                 if r["prompt_policy_version_id"] is not None
                 else None
             ),
+            "embedding_model": r["embedding_model"],
+            "embedding_ref": r["embedding_ref"],
+            "intended_contrast": _loads(r["intended_contrast_json"], None),
+            "llm_suggested_traits": _loads(r["llm_suggested_traits_json"], None),
+            "expected_response_pattern": r["expected_response_pattern"],
+            "risk_notes": r["risk_notes"],
+            "provisional_w_source": r["provisional_w_source"],
+            "provisional_w_confidence": (
+                float(r["provisional_w_confidence"]) if r["provisional_w_confidence"] is not None else None
+            ),
+            "calibration_status": r["calibration_status"],
             "created_at": int(r["created_at"]),
         }
         for r in rows
@@ -1539,23 +1726,58 @@ def list_prompt_policy_versions(conn: sqlite3.Connection) -> List[Dict[str, Any]
 
 def seed_prompt_policies(conn: sqlite3.Connection, generic_template: str) -> None:
     """
-    Insert the initial 'generic' prompt policy (v1) if no policy exists yet.
-    Idempotent: skips silently if any prompt_policy_versions row already exists.
+    Insert the initial generic prompt policy if missing.
     """
     existing = conn.execute(
-        "SELECT COUNT(*) FROM prompt_policy_versions;"
+        "SELECT COUNT(*) FROM prompt_policy_versions WHERE name = ?;",
+        ("generic",),
     ).fetchone()
     if int(existing[0]) > 0:
         return
-
     insert_prompt_policy_version(
         conn,
         name="generic",
         prompt_template=generic_template,
         strategy_type="generic",
         conditioning_mode="none",
-        active=True,
+        active=get_active_prompt_policy_version(conn) is None,
     )
+
+
+def seed_exploratory_prompt_policies(conn: sqlite3.Connection) -> None:
+    """Insert optional exploratory prompt policies if missing. Generic remains active."""
+    try:
+        from models.prompt_policy import (
+            ANTI_REDUNDANCY_TEMPLATE,
+            PROFILE_CONTRAST_TEMPLATE,
+            TRADEOFF_SCENARIO_TEMPLATE,
+            UNCERTAINTY_TARGETED_TEMPLATE,
+        )
+    except Exception:
+        return
+
+    policies = [
+        ("uncertainty_targeted", "uncertainty_targeted", "posterior_only", UNCERTAINTY_TARGETED_TEMPLATE, False),
+        ("profile_contrast", "profile_contrast", "posterior_only", PROFILE_CONTRAST_TEMPLATE, False),
+        ("tradeoff_scenario", "tradeoff_scenario", "none", TRADEOFF_SCENARIO_TEMPLATE, False),
+        ("anti_redundancy", "anti_redundancy", "none", ANTI_REDUNDANCY_TEMPLATE, False),
+    ]
+
+    for name, strategy, conditioning, template, active in policies:
+        existing = conn.execute(
+            "SELECT COUNT(*) FROM prompt_policy_versions WHERE name = ?;",
+            (name,),
+        ).fetchone()
+        if int(existing[0]) > 0:
+            continue
+        insert_prompt_policy_version(
+            conn,
+            name=name,
+            prompt_template=template,
+            strategy_type=strategy,
+            conditioning_mode=conditioning,
+            active=active,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1697,3 +1919,97 @@ def get_generated_candidate_for_session_question(
         ),
     }
 
+
+def insert_question_calibration_run(
+    conn: sqlite3.Connection,
+    *,
+    question_id: str,
+    status: str,
+    n_responses: int,
+    old_version: Optional[int],
+    new_version: Optional[int],
+    active_promoted: bool,
+    method: str,
+    diagnostics: Optional[Dict[str, Any]] = None,
+) -> int:
+    conn.execute(
+        """
+        INSERT INTO question_calibration_runs (
+          question_id, status, n_responses, old_version, new_version,
+          active_promoted, method, diagnostics_json, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
+        """,
+        (
+            question_id,
+            status,
+            int(n_responses),
+            int(old_version) if old_version is not None else None,
+            int(new_version) if new_version is not None else None,
+            1 if active_promoted else 0,
+            method,
+            _dumps(diagnostics) if diagnostics is not None else None,
+            _utc_ts(),
+        ),
+    )
+    conn.commit()
+    return int(conn.execute("SELECT last_insert_rowid();").fetchone()[0])
+
+
+def list_question_calibration_runs(
+    conn: sqlite3.Connection, question_id: Optional[str] = None
+) -> List[Dict[str, Any]]:
+    if question_id is None:
+        rows = conn.execute(
+            "SELECT * FROM question_calibration_runs ORDER BY created_at ASC, id ASC;"
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM question_calibration_runs WHERE question_id = ? ORDER BY created_at ASC, id ASC;",
+            (question_id,),
+        ).fetchall()
+    return [
+        {
+            "id": int(r["id"]),
+            "question_id": r["question_id"],
+            "status": r["status"],
+            "n_responses": int(r["n_responses"]),
+            "old_version": int(r["old_version"]) if r["old_version"] is not None else None,
+            "new_version": int(r["new_version"]) if r["new_version"] is not None else None,
+            "active_promoted": bool(r["active_promoted"]),
+            "method": r["method"],
+            "diagnostics": _loads(r["diagnostics_json"], None),
+            "created_at": int(r["created_at"]),
+        }
+        for r in rows
+    ]
+
+
+def insert_prompt_policy_score(
+    conn: sqlite3.Connection,
+    *,
+    prompt_policy_version_id: int,
+    n_requests: int,
+    n_candidates: int,
+    n_selected: int,
+    reward_score: float,
+    metrics: Dict[str, Any],
+) -> int:
+    conn.execute(
+        """
+        INSERT INTO prompt_policy_scores (
+          prompt_policy_version_id, n_requests, n_candidates, n_selected,
+          reward_score, metrics_json, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?);
+        """,
+        (
+            int(prompt_policy_version_id),
+            int(n_requests),
+            int(n_candidates),
+            int(n_selected),
+            float(reward_score),
+            _dumps(metrics),
+            _utc_ts(),
+        ),
+    )
+    conn.commit()
+    return int(conn.execute("SELECT last_insert_rowid();").fetchone()[0])

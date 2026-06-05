@@ -1,0 +1,391 @@
+*, *::before, *::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+:root {
+  --bg: #f5f6fa;
+  --surface: #ffffff;
+  --border: #e2e5ef;
+  --text: #1a1d2e;
+  --text-sub: #6b6f88;
+  --accent: #4f46e5;
+  --accent-light: #ede9fe;
+  --accent-hover: #4338ca;
+  --error: #dc2626;
+  --success: #059669;
+  --radius: 12px;
+  --shadow: 0 2px 12px rgba(0, 0, 0, 0.07);
+  font-family: system-ui, -apple-system, 'Segoe UI', sans-serif;
+  font-size: 16px;
+  line-height: 1.5;
+  color: var(--text);
+  background: var(--bg);
+}
+
+/* Layout */
+
+.app {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+
+.header {
+  width: 100%;
+  max-width: 680px;
+  padding: 28px 24px 0;
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+}
+
+.header-title {
+  font-size: 1.1rem;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  color: var(--accent);
+}
+
+.header-sub {
+  font-size: 0.85rem;
+  color: var(--text-sub);
+}
+
+.main {
+  width: 100%;
+  max-width: 680px;
+  padding: 24px 24px 48px;
+}
+
+/* Card */
+
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  padding: 32px;
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+}
+
+/* Progress */
+
+.progress-track {
+  height: 4px;
+  background: var(--border);
+  border-radius: 2px;
+  overflow: hidden;
+}
+
+.progress-fill {
+  height: 100%;
+  background: var(--accent);
+  border-radius: 2px;
+  transition: width 0.4s ease;
+}
+
+.step-label {
+  font-size: 0.82rem;
+  color: var(--text-sub);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Question */
+
+.question-text {
+  font-size: 1.2rem;
+  line-height: 1.6;
+  font-weight: 500;
+  color: var(--text);
+  padding: 8px 0;
+}
+
+/* Likert buttons */
+
+.likert-row {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.likert-row.likert-disabled {
+  opacity: 0.5;
+  pointer-events: none;
+}
+
+.likert-btn {
+  flex: 1;
+  min-width: 80px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  padding: 14px 8px;
+  background: var(--bg);
+  border: 1.5px solid var(--border);
+  border-radius: 10px;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s, transform 0.1s;
+  user-select: none;
+}
+
+.likert-btn:hover:not(:disabled) {
+  background: var(--accent-light);
+  border-color: var(--accent);
+}
+
+.likert-btn:active:not(:disabled) {
+  transform: scale(0.97);
+}
+
+.likert-btn:disabled {
+  cursor: not-allowed;
+}
+
+.likert-num {
+  font-size: 1.25rem;
+  font-weight: 700;
+  color: var(--accent);
+}
+
+.likert-label {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  font-size: 0.72rem;
+  color: var(--text-sub);
+  text-align: center;
+  line-height: 1.3;
+}
+
+.label-line {
+  display: block;
+}
+
+/* Status / errors */
+
+.status-text {
+  font-size: 0.85rem;
+  color: var(--text-sub);
+}
+
+.error-msg {
+  font-size: 0.85rem;
+  color: var(--error);
+}
+
+/* Loading / error full-screen */
+
+.center-screen {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 16px;
+  padding: 48px 24px;
+  text-align: center;
+}
+
+.loading-text {
+  color: var(--text-sub);
+  font-size: 0.95rem;
+}
+
+.error-hint {
+  font-size: 0.85rem;
+  color: var(--text-sub);
+  max-width: 320px;
+}
+
+.spinner {
+  width: 36px;
+  height: 36px;
+  border: 3px solid var(--border);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 0.7s linear infinite;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+/* Primary button */
+
+.btn-primary {
+  background: var(--accent);
+  color: #fff;
+  border: none;
+  border-radius: 8px;
+  padding: 12px 28px;
+  font-size: 0.95rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.15s, transform 0.1s;
+}
+
+.btn-primary:hover {
+  background: var(--accent-hover);
+}
+
+.btn-primary:active {
+  transform: scale(0.98);
+}
+
+/* Summary page */
+
+.summary {
+  width: 100%;
+  max-width: 680px;
+  margin: 0 auto;
+  padding: 40px 24px 64px;
+  display: flex;
+  flex-direction: column;
+  gap: 32px;
+}
+
+.summary-top {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.summary-title {
+  font-size: 1.6rem;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  color: var(--text);
+}
+
+.summary-sub {
+  font-size: 0.95rem;
+  color: var(--text-sub);
+}
+
+/* Trait list */
+
+.trait-list {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  overflow: hidden;
+}
+
+.trait-row {
+  display: flex;
+  align-items: center;
+  gap: 20px;
+  padding: 20px 24px;
+  border-bottom: 1px solid var(--border);
+}
+
+.trait-row:last-child {
+  border-bottom: none;
+}
+
+.trait-meta {
+  flex: 0 0 180px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.trait-name {
+  font-weight: 600;
+  font-size: 0.95rem;
+  color: var(--text);
+}
+
+.trait-desc {
+  font-size: 0.75rem;
+  color: var(--text-sub);
+  line-height: 1.4;
+}
+
+.trait-bar-wrap {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.trait-track {
+  flex: 1;
+  height: 10px;
+  background: var(--border);
+  border-radius: 5px;
+  position: relative;
+  overflow: hidden;
+}
+
+.trait-fill {
+  position: absolute;
+  left: 0;
+  top: 0;
+  height: 100%;
+  background: var(--accent);
+  border-radius: 5px;
+  transition: width 0.8s cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.trait-uncertainty {
+  position: absolute;
+  top: 0;
+  height: 100%;
+  background: rgba(79, 70, 229, 0.18);
+  border-radius: 5px;
+}
+
+.trait-pct {
+  flex: 0 0 40px;
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: var(--accent);
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.summary-note {
+  font-size: 0.8rem;
+  color: var(--text-sub);
+  line-height: 1.6;
+}
+
+/* Responsive */
+
+@media (max-width: 500px) {
+  .card {
+    padding: 24px 20px;
+  }
+
+  .likert-btn {
+    min-width: 56px;
+    padding: 12px 6px;
+  }
+
+  .likert-label {
+    font-size: 0.66rem;
+  }
+
+  .trait-row {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 10px;
+    padding: 16px 20px;
+  }
+
+  .trait-meta {
+    flex: none;
+  }
+
+  .trait-bar-wrap {
+    width: 100%;
+  }
+}

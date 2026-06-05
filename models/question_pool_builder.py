@@ -5,6 +5,7 @@ Build inference pools from seed items plus optional LLM-generated questions with
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import hashlib
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -23,6 +24,11 @@ class GeneratedPoolResult:
 _SIM_THRESHOLD = 0.9
 # Minimum generated items to return when enough seed-safe candidates exist.
 _MIN_CANDIDATES = 5
+_EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2-or-hashing-fallback"
+
+
+def _embedding_ref(text: str) -> str:
+    return "sha256:" + hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 def _greedy_dedupe_generated(
@@ -116,9 +122,16 @@ def _dedupe_generated_candidates_with_meta(
             {
                 "candidate_index": i,
                 "text": str(candidates[i].get("text", "")),
+                "intended_contrast": candidates[i].get("intended_contrast"),
+                "expected_response_pattern": candidates[i].get("expected_response_pattern"),
+                "risk_notes": candidates[i].get("risk_notes"),
+                "llm_suggested_traits": candidates[i].get("suggested_traits") or candidates[i].get("llm_suggested_traits"),
+                "embedding_model": _EMBEDDING_MODEL_NAME,
+                "embedding_ref": _embedding_ref(str(candidates[i].get("text", ""))),
                 "max_seed_similarity": float(max_seed_sim[i]),
                 "max_kept_similarity": None,
                 "dedupe_failed": True,
+                "calibration_status": "rejected",
             }
             for i in range(len(candidates))
         ]
@@ -153,6 +166,12 @@ def _dedupe_generated_candidates_with_meta(
         meta.append({
             "candidate_index": i,
             "text": str(candidates[i].get("text", "")),
+            "intended_contrast": candidates[i].get("intended_contrast"),
+            "expected_response_pattern": candidates[i].get("expected_response_pattern"),
+            "risk_notes": candidates[i].get("risk_notes"),
+            "llm_suggested_traits": candidates[i].get("suggested_traits") or candidates[i].get("llm_suggested_traits"),
+            "embedding_model": _EMBEDDING_MODEL_NAME,
+            "embedding_ref": _embedding_ref(str(candidates[i].get("text", ""))),
             "max_seed_similarity": float(max_seed_sim[i]),
             # None for seed-rejected candidates (never reached dedupe) and for accepted ones.
             "max_kept_similarity": (
@@ -214,6 +233,9 @@ def build_generated_pool(
         m["thresholds"] = None
         m["nn_seed_ids"] = None
         m["nn_similarities"] = None
+        m["provisional_w_source"] = None
+        m["provisional_w_confidence"] = None
+        m["calibration_status"] = "candidate"
 
     if not deduped:
         return GeneratedPoolResult(accepted=[], all_candidates_metadata=all_meta)
@@ -241,9 +263,14 @@ def build_generated_pool(
             )
             m["nn_seed_ids"] = list(row.get("nn_seed_ids") or [])
             m["nn_similarities"] = list(row.get("nn_similarities") or [])
+            m["provisional_w_source"] = "embedding_knn_seed_average"
+            sims = [float(x) for x in m["nn_similarities"] or []]
+            m["provisional_w_confidence"] = float(np.mean(np.maximum(sims, 0.0))) if sims else 0.0
+            m["calibration_status"] = "accepted_uncalibrated"
             valid.append(row)
         else:
             m["validation_failure_reason"] = reason
+            m["calibration_status"] = "rejected"
             import warnings
             warnings.warn(
                 f"Generated question rejected ({reason}): {str(row.get('text', ''))[:80]}",

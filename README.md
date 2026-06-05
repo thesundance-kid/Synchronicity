@@ -102,6 +102,42 @@ synchronicity/
 
 ---
 
+## Local Development
+
+### Backend
+
+```bash
+pip install -r requirements.txt
+uvicorn app.main:app --reload --port 8000
+```
+
+The API will be available at `http://localhost:8000`. Interactive docs at `http://localhost:8000/docs`.
+
+### Frontend
+
+Requires Node 18+.
+
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
+Open `http://localhost:5173` in your browser. The frontend talks to the backend at `http://localhost:8000` — CORS is pre-configured for that origin.
+
+Both processes must be running simultaneously. Start the backend first.
+
+### Environment variables (optional)
+
+| Variable | Default | Notes |
+|---|---|---|
+| `ANTHROPIC_API_KEY` | `""` | Set to enable live LLM question generation. |
+| `LLM_MODEL` | `claude-haiku-4-5-20251001` | Any Anthropic model ID. |
+| `PILOT_DB_PATH` | `data/pilot.db` | SQLite database path. |
+| `FRONTEND_ORIGINS` | `http://localhost:3000,http://localhost:5173` | Comma-separated CORS origins. |
+
+---
+
 ## API
 
 Start the server:

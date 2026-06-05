@@ -84,8 +84,41 @@ Seed questions (do not repeat or closely mimic these):
 {seeds_block}
 
 Output format:
-- Number each line starting with the number, a period, and a space (e.g. "1. ...", "2. ...").
-- Output only the numbered list, no other commentary.
+Return only a JSON array. Each item must have:
+- "text": the question text
+- "intended_contrast": what profiles this item is meant to distinguish
+- "expected_response_pattern": how those profiles should differ
+- "risk_notes": brief safety/neutrality note
+- "suggested_traits": optional list of trait names involved
+"""
+
+
+UNCERTAINTY_TARGETED_TEMPLATE = GENERIC_TEMPLATE + """
+
+Prefer questions that distinguish people along high-uncertainty trait combinations.
+{uncertainty_context}
+"""
+
+
+PROFILE_CONTRAST_TEMPLATE = GENERIC_TEMPLATE + """
+
+Prefer concrete scenario questions that separate two plausible personality profiles,
+especially when a single trait label would be too simplistic.
+{posterior_context}
+"""
+
+
+TRADEOFF_SCENARIO_TEMPLATE = GENERIC_TEMPLATE + """
+
+Prefer everyday tradeoff scenarios where different latent profiles would naturally
+choose different responses. Avoid obvious trait-name wording.
+"""
+
+
+ANTI_REDUNDANCY_TEMPLATE = GENERIC_TEMPLATE + """
+
+Prioritize semantic novelty. Avoid paraphrases of seed questions and avoid asking
+about the same situation with only surface-level wording changes.
 """
 
 
