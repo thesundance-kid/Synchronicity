@@ -116,6 +116,16 @@ def _migrate_generated_candidates_phase5(conn: sqlite3.Connection) -> None:
         )
 
 
+def _migrate_prompt_policy_versions_phase8(conn: sqlite3.Connection) -> None:
+    """Add routing_enabled column to prompt_policy_versions (idempotent)."""
+    info = conn.execute("PRAGMA table_info(prompt_policy_versions);").fetchall()
+    col_names = {row[1] for row in info}
+    if "routing_enabled" not in col_names:
+        conn.execute(
+            "ALTER TABLE prompt_policy_versions ADD COLUMN routing_enabled INTEGER NOT NULL DEFAULT 0;"
+        )
+
+
 def _migrate_question_performance_events_phase6(conn: sqlite3.Connection) -> None:
     """Add Phase 6 direct lineage columns to question_performance_events (idempotent)."""
     info = conn.execute("PRAGMA table_info(question_performance_events);").fetchall()
@@ -145,6 +155,26 @@ def _migrate_llm_generation_requests_phase6(conn: sqlite3.Connection) -> None:
     if "error_message" not in col_names:
         conn.execute(
             "ALTER TABLE llm_generation_requests ADD COLUMN error_message TEXT;"
+        )
+
+
+def _migrate_llm_generation_requests_phase9(conn: sqlite3.Connection) -> None:
+    """Add raw_response_text column to llm_generation_requests (idempotent)."""
+    info = conn.execute("PRAGMA table_info(llm_generation_requests);").fetchall()
+    col_names = {row[1] for row in info}
+    if "raw_response_text" not in col_names:
+        conn.execute(
+            "ALTER TABLE llm_generation_requests ADD COLUMN raw_response_text TEXT;"
+        )
+
+
+def _migrate_selection_score_logs_phase9(conn: sqlite3.Connection) -> None:
+    """Add candidate_rank column to selection_score_logs (idempotent)."""
+    info = conn.execute("PRAGMA table_info(selection_score_logs);").fetchall()
+    col_names = {row[1] for row in info}
+    if "candidate_rank" not in col_names:
+        conn.execute(
+            "ALTER TABLE selection_score_logs ADD COLUMN candidate_rank INTEGER NOT NULL DEFAULT 0;"
         )
 
 
@@ -265,6 +295,7 @@ def init_db(conn: sqlite3.Connection) -> None:
         );
         """
     )
+    _migrate_selection_score_logs_phase9(conn)
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS session_run_logs (
@@ -384,6 +415,12 @@ def init_db(conn: sqlite3.Connection) -> None:
         """
     )
     _migrate_question_performance_events_phase6(conn)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_qpe_question_id ON question_performance_events(question_id);"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_qpe_question_created ON question_performance_events(question_id, created_at);"
+    )
 
     # Phase 4: versioned question measurement parameters (w, noise_var, thresholds).
     # Each row is one immutable snapshot of a question's parameters at a point in time.
@@ -410,6 +447,7 @@ def init_db(conn: sqlite3.Connection) -> None:
 
     # Phase 5: versioned prompt/probe-generation policy.
     # Only one row may be active=1 at a time (globally, not per-name).
+    # Phase 8: routing_enabled=1 means eligible for epsilon-greedy routing.
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS prompt_policy_versions (
@@ -421,11 +459,13 @@ def init_db(conn: sqlite3.Connection) -> None:
           conditioning_mode TEXT    NOT NULL DEFAULT 'none',
           output_schema_json TEXT,
           active            INTEGER NOT NULL DEFAULT 1,
+          routing_enabled   INTEGER NOT NULL DEFAULT 0,
           created_at        INTEGER NOT NULL,
           UNIQUE(name, version)
         );
         """
     )
+    _migrate_prompt_policy_versions_phase8(conn)
 
     # Phase 5: one row per LLM candidate-generation event.
     # Links session → prompt policy → posterior context → rendered prompt → candidates.
@@ -458,6 +498,7 @@ def init_db(conn: sqlite3.Connection) -> None:
         """
     )
     _migrate_llm_generation_requests_phase6(conn)
+    _migrate_llm_generation_requests_phase9(conn)
 
     # Phase 3: per-session metadata for every raw LLM-generated candidate question.
     # Phase 5 adds generation_request_id and prompt_policy_version_id for full lineage.
@@ -493,6 +534,9 @@ def init_db(conn: sqlite3.Connection) -> None:
     )
     _migrate_generated_candidates_phase5(conn)
     conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_gqc_question_id ON generated_question_candidates(question_id);"
+    )
+    conn.execute(
         """
         CREATE TABLE IF NOT EXISTS question_calibration_runs (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -523,6 +567,90 @@ def init_db(conn: sqlite3.Connection) -> None:
         );
         """
     )
+
+    # Phase 8: durable job queue for offline question calibration.
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS calibration_jobs (
+          id                          INTEGER PRIMARY KEY AUTOINCREMENT,
+          question_id                 TEXT    NOT NULL,
+          current_parameter_version_id INTEGER,
+          status                      TEXT    NOT NULL DEFAULT 'pending',
+          reason                      TEXT,
+          created_at                  INTEGER NOT NULL,
+          started_at                  INTEGER,
+          finished_at                 INTEGER,
+          attempt_count               INTEGER NOT NULL DEFAULT 0,
+          last_error                  TEXT,
+          old_loss                    REAL,
+          new_loss                    REAL,
+          loss_improvement            REAL,
+          old_w_json                  TEXT,
+          new_w_json                  TEXT,
+          quality_gates_json          TEXT,
+          promoted_parameter_version_id INTEGER
+        );
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_calibration_jobs_status ON calibration_jobs(status);"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_calibration_jobs_question ON calibration_jobs(question_id, current_parameter_version_id);"
+    )
+
+    # Phase 8: durable job queue for prompt-policy score refresh.
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS policy_score_jobs (
+          id                       INTEGER PRIMARY KEY AUTOINCREMENT,
+          prompt_policy_version_id INTEGER NOT NULL,
+          status                   TEXT    NOT NULL DEFAULT 'pending',
+          reason                   TEXT,
+          created_at               INTEGER NOT NULL,
+          started_at               INTEGER,
+          finished_at              INTEGER,
+          attempt_count            INTEGER NOT NULL DEFAULT 0,
+          last_error               TEXT,
+          old_score                REAL,
+          new_score                REAL,
+          score_components_json    TEXT,
+          FOREIGN KEY(prompt_policy_version_id) REFERENCES prompt_policy_versions(id)
+        );
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_policy_score_jobs_status ON policy_score_jobs(status);"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_policy_score_jobs_policy ON policy_score_jobs(prompt_policy_version_id);"
+    )
+
+    # Phase 8: per-session routing decision log.
+    # No FK on session_id: the row is written before insert_session in create_session.
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS policy_routing_decisions (
+          id                       INTEGER PRIMARY KEY AUTOINCREMENT,
+          session_id               TEXT    NOT NULL,
+          prompt_policy_version_id INTEGER NOT NULL,
+          routing_strategy         TEXT    NOT NULL,
+          decision_type            TEXT    NOT NULL,
+          epsilon                  REAL,
+          n_eligible_policies      INTEGER,
+          scores_considered_json   TEXT,
+          created_at               INTEGER NOT NULL,
+          FOREIGN KEY(prompt_policy_version_id) REFERENCES prompt_policy_versions(id)
+        );
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_routing_decisions_session ON policy_routing_decisions(session_id);"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_routing_decisions_policy ON policy_routing_decisions(prompt_policy_version_id);"
+    )
+
     conn.commit()
 
 
@@ -719,6 +847,19 @@ def insert_step_log(
     conn.commit()
 
 
+def has_selection_score_log(
+    conn: sqlite3.Connection,
+    session_id: str,
+    step_idx: int,
+) -> bool:
+    """Return True if a selected=1 row already exists for (session_id, step_idx)."""
+    row = conn.execute(
+        "SELECT 1 FROM selection_score_logs WHERE session_id = ? AND step_idx = ? AND selected = 1 LIMIT 1;",
+        (session_id, int(step_idx)),
+    ).fetchone()
+    return row is not None
+
+
 def insert_selection_score_log(
     conn: sqlite3.Connection,
     *,
@@ -729,15 +870,17 @@ def insert_selection_score_log(
     components: Dict[str, Any],
     calibration_status: Optional[str] = None,
     selected: bool = True,
+    candidate_rank: Optional[int] = None,
 ) -> None:
+    rank = int(candidate_rank) if candidate_rank is not None else (0 if selected else None)
     conn.execute(
         """
         INSERT INTO selection_score_logs (
           session_id, step_idx, question_id, question_source,
           selection_score, expected_information_gain, semantic_novelty,
           exploration_bonus, policy_quality_prior, redundancy_penalty,
-          risk_penalty, calibration_status, selected, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+          risk_penalty, calibration_status, selected, candidate_rank, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
         """,
         (
             session_id,
@@ -753,6 +896,7 @@ def insert_selection_score_log(
             float(components.get("risk_penalty", 0.0)),
             calibration_status,
             1 if selected else 0,
+            rank,
             _utc_ts(),
         ),
     )
@@ -764,10 +908,11 @@ def list_selection_score_logs(conn: sqlite3.Connection, session_id: str) -> List
         """
         SELECT * FROM selection_score_logs
         WHERE session_id = ?
-        ORDER BY step_idx ASC, id ASC;
+        ORDER BY step_idx ASC, candidate_rank ASC, id ASC;
         """,
         (session_id,),
     ).fetchall()
+    keys = rows[0].keys() if rows else []
     return [
         {
             "session_id": r["session_id"],
@@ -783,6 +928,7 @@ def list_selection_score_logs(conn: sqlite3.Connection, session_id: str) -> List
             "risk_penalty": float(r["risk_penalty"]) if r["risk_penalty"] is not None else None,
             "calibration_status": r["calibration_status"],
             "selected": bool(r["selected"]),
+            "candidate_rank": int(r["candidate_rank"]) if "candidate_rank" in keys and r["candidate_rank"] is not None else 0,
             "created_at": int(r["created_at"]),
         }
         for r in rows
@@ -1217,6 +1363,11 @@ def _qpe_row_to_dict(r) -> Dict[str, Any]:
             if "prompt_policy_version_id" in keys and r["prompt_policy_version_id"] is not None
             else None
         ),
+        "calibration_status": (
+            r["calibration_status"]
+            if "calibration_status" in keys
+            else "candidate"
+        ),
         "created_at": int(r["created_at"]),
     }
 
@@ -1242,6 +1393,7 @@ def insert_question_performance_event(
     generated_candidate_id: Optional[int] = None,
     generation_request_id: Optional[int] = None,
     prompt_policy_version_id: Optional[int] = None,
+    calibration_status: Optional[str] = None,
 ) -> None:
     conn.execute(
         """
@@ -1252,8 +1404,8 @@ def insert_question_performance_event(
             response_value,
             mu_before_json, sigma_before_json, mu_after_json, sigma_after_json,
             generated_candidate_id, generation_request_id, prompt_policy_version_id,
-            created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+            calibration_status, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
         """,
         (
             question_id,
@@ -1274,6 +1426,7 @@ def insert_question_performance_event(
             int(generated_candidate_id) if generated_candidate_id is not None else None,
             int(generation_request_id) if generation_request_id is not None else None,
             int(prompt_policy_version_id) if prompt_policy_version_id is not None else None,
+            str(calibration_status) if calibration_status is not None else "candidate",
             _utc_ts(),
         ),
     )
@@ -1643,6 +1796,7 @@ def seed_question_parameters(conn: sqlite3.Connection, questions_v2_path: str) -
 # ---------------------------------------------------------------------------
 
 def _ppv_row_to_dict(r) -> Dict[str, Any]:
+    keys = r.keys()
     return {
         "id": int(r["id"]),
         "name": r["name"],
@@ -1652,6 +1806,7 @@ def _ppv_row_to_dict(r) -> Dict[str, Any]:
         "conditioning_mode": r["conditioning_mode"],
         "output_schema_json": r["output_schema_json"],
         "active": bool(r["active"]),
+        "routing_enabled": bool(r["routing_enabled"]) if "routing_enabled" in keys else False,
         "created_at": int(r["created_at"]),
     }
 
@@ -1665,14 +1820,15 @@ def insert_prompt_policy_version(
     conditioning_mode: str = "none",
     output_schema: Optional[Dict[str, Any]] = None,
     active: bool = True,
+    routing_enabled: bool = True,
 ) -> int:
     """
-    Insert a new prompt policy version for *name* and return its (id, version).
+    Insert a new prompt policy version for *name* and return its row id.
 
     Version is auto-incremented (max existing + 1 for this name, or 1 if none).
     If *active* is True, all prior active rows across the whole table are deactivated
     first (only one globally active policy at a time).
-    Returns the new row's ``id``.
+    *routing_enabled* marks the policy as eligible for epsilon-greedy routing.
     """
     if active:
         conn.execute("UPDATE prompt_policy_versions SET active = 0 WHERE active = 1;")
@@ -1687,8 +1843,8 @@ def insert_prompt_policy_version(
         """
         INSERT INTO prompt_policy_versions
           (name, version, strategy_type, prompt_template, conditioning_mode,
-           output_schema_json, active, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?);
+           output_schema_json, active, routing_enabled, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
         """,
         (
             str(name),
@@ -1698,6 +1854,7 @@ def insert_prompt_policy_version(
             str(conditioning_mode),
             _dumps(output_schema) if output_schema is not None else None,
             1 if active else 0,
+            1 if routing_enabled else 0,
             _utc_ts(),
         ),
     )
@@ -1741,7 +1898,18 @@ def seed_prompt_policies(conn: sqlite3.Connection, generic_template: str) -> Non
         strategy_type="generic",
         conditioning_mode="none",
         active=get_active_prompt_policy_version(conn) is None,
+        routing_enabled=True,
     )
+
+
+def backfill_routing_enabled(conn: sqlite3.Connection) -> None:
+    """Set routing_enabled=1 on all existing seeded policies that have routing_enabled=0."""
+    seeded_names = ("generic", "uncertainty_targeted", "profile_contrast", "tradeoff_scenario", "anti_redundancy")
+    conn.execute(
+        f"UPDATE prompt_policy_versions SET routing_enabled = 1 WHERE routing_enabled = 0 AND name IN ({','.join('?'*len(seeded_names))});",
+        seeded_names,
+    )
+    conn.commit()
 
 
 def seed_exploratory_prompt_policies(conn: sqlite3.Connection) -> None:
@@ -1777,6 +1945,7 @@ def seed_exploratory_prompt_policies(conn: sqlite3.Connection) -> None:
             strategy_type=strategy,
             conditioning_mode=conditioning,
             active=active,
+            routing_enabled=True,
         )
 
 
@@ -1804,6 +1973,7 @@ def insert_llm_generation_request(
     n_returned: int,
     status: str = "success",
     error_message: Optional[str] = None,
+    raw_response_text: Optional[str] = None,
 ) -> int:
     """Insert one LLM generation event and return its row id."""
     conn.execute(
@@ -1814,8 +1984,8 @@ def insert_llm_generation_request(
           uncertainty_summary_json, question_history_summary_json,
           answer_history_summary_json, unresolved_tensions_json,
           prompt_rendered, model_name, n_requested, n_returned,
-          status, error_message, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+          status, error_message, raw_response_text, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
         """,
         (
             session_id,
@@ -1835,6 +2005,7 @@ def insert_llm_generation_request(
             int(n_returned),
             str(status),
             error_message,
+            raw_response_text,
             _utc_ts(),
         ),
     )
@@ -1853,7 +2024,7 @@ def list_llm_generation_requests_for_session(
                uncertainty_summary_json, question_history_summary_json,
                answer_history_summary_json, unresolved_tensions_json,
                prompt_rendered, model_name, n_requested, n_returned,
-               status, error_message, created_at
+               status, error_message, raw_response_text, created_at
         FROM llm_generation_requests
         WHERE session_id = ?
         ORDER BY id ASC;
@@ -1884,6 +2055,7 @@ def list_llm_generation_requests_for_session(
             "n_returned": int(r["n_returned"]),
             "status": r["status"] if "status" in r.keys() else "success",
             "error_message": r["error_message"] if "error_message" in r.keys() else None,
+            "raw_response_text": r["raw_response_text"] if "raw_response_text" in r.keys() else None,
             "created_at": int(r["created_at"]),
         }
         for r in rows
@@ -2013,3 +2185,407 @@ def insert_prompt_policy_score(
     )
     conn.commit()
     return int(conn.execute("SELECT last_insert_rowid();").fetchone()[0])
+
+
+def get_latest_policy_score(
+    conn: sqlite3.Connection, prompt_policy_version_id: int
+) -> Optional[Dict[str, Any]]:
+    row = conn.execute(
+        """
+        SELECT * FROM prompt_policy_scores
+        WHERE prompt_policy_version_id = ?
+        ORDER BY created_at DESC, id DESC
+        LIMIT 1;
+        """,
+        (int(prompt_policy_version_id),),
+    ).fetchone()
+    if row is None:
+        return None
+    return {
+        "id": int(row["id"]),
+        "prompt_policy_version_id": int(row["prompt_policy_version_id"]),
+        "n_requests": int(row["n_requests"]),
+        "n_candidates": int(row["n_candidates"]),
+        "n_selected": int(row["n_selected"]),
+        "reward_score": float(row["reward_score"]),
+        "metrics": _loads(row["metrics_json"], {}),
+        "created_at": int(row["created_at"]),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Phase 8: calibration_jobs
+# ---------------------------------------------------------------------------
+
+def queue_calibration_job_if_eligible(
+    conn: sqlite3.Connection,
+    *,
+    question_id: str,
+    min_responses: int = 50,
+) -> Optional[int]:
+    """
+    Create a pending calibration job for *question_id* if it has crossed the
+    response threshold and no pending/running/succeeded job exists for the current
+    parameter version. Returns the new job id, or None if not created.
+    """
+    n = conn.execute(
+        "SELECT COUNT(*) FROM question_performance_events WHERE question_id = ?;",
+        (question_id,),
+    ).fetchone()[0]
+    if int(n) < min_responses:
+        return None
+
+    active_pv = get_active_question_parameter_version(conn, question_id)
+    current_version_id = int(active_pv["id"]) if active_pv is not None else None
+
+    existing = conn.execute(
+        """
+        SELECT id FROM calibration_jobs
+        WHERE question_id = ?
+          AND (current_parameter_version_id = ? OR (current_parameter_version_id IS NULL AND ? IS NULL))
+          AND status IN ('pending', 'running', 'succeeded')
+        LIMIT 1;
+        """,
+        (question_id, current_version_id, current_version_id),
+    ).fetchone()
+    if existing is not None:
+        return None
+
+    conn.execute(
+        """
+        INSERT INTO calibration_jobs
+          (question_id, current_parameter_version_id, status, created_at)
+        VALUES (?, ?, 'pending', ?);
+        """,
+        (question_id, current_version_id, _utc_ts()),
+    )
+    conn.commit()
+    return int(conn.execute("SELECT last_insert_rowid();").fetchone()[0])
+
+
+def list_calibration_jobs(
+    conn: sqlite3.Connection,
+    *,
+    status: Optional[str] = None,
+    question_id: Optional[str] = None,
+    limit: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    where: List[str] = []
+    params: List[Any] = []
+    if status is not None:
+        where.append("status = ?")
+        params.append(status)
+    if question_id is not None:
+        where.append("question_id = ?")
+        params.append(question_id)
+    clause = ("WHERE " + " AND ".join(where)) if where else ""
+    limit_clause = f"LIMIT {int(limit)}" if limit is not None else ""
+    rows = conn.execute(
+        f"SELECT * FROM calibration_jobs {clause} ORDER BY created_at ASC, id ASC {limit_clause};",
+        params,
+    ).fetchall()
+    return [
+        {
+            "id": int(r["id"]),
+            "question_id": r["question_id"],
+            "current_parameter_version_id": (
+                int(r["current_parameter_version_id"]) if r["current_parameter_version_id"] is not None else None
+            ),
+            "status": r["status"],
+            "reason": r["reason"],
+            "created_at": int(r["created_at"]),
+            "started_at": int(r["started_at"]) if r["started_at"] is not None else None,
+            "finished_at": int(r["finished_at"]) if r["finished_at"] is not None else None,
+            "attempt_count": int(r["attempt_count"]),
+            "last_error": r["last_error"],
+            "old_loss": float(r["old_loss"]) if r["old_loss"] is not None else None,
+            "new_loss": float(r["new_loss"]) if r["new_loss"] is not None else None,
+            "loss_improvement": float(r["loss_improvement"]) if r["loss_improvement"] is not None else None,
+            "old_w": _loads(r["old_w_json"], None),
+            "new_w": _loads(r["new_w_json"], None),
+            "quality_gates": _loads(r["quality_gates_json"], None),
+            "promoted_parameter_version_id": (
+                int(r["promoted_parameter_version_id"])
+                if r["promoted_parameter_version_id"] is not None
+                else None
+            ),
+        }
+        for r in rows
+    ]
+
+
+def update_calibration_job(
+    conn: sqlite3.Connection,
+    *,
+    job_id: int,
+    status: str,
+    reason: Optional[str] = None,
+    started_at: Optional[int] = None,
+    finished_at: Optional[int] = None,
+    attempt_count: Optional[int] = None,
+    last_error: Optional[str] = None,
+    old_loss: Optional[float] = None,
+    new_loss: Optional[float] = None,
+    loss_improvement: Optional[float] = None,
+    old_w: Optional[List[float]] = None,
+    new_w: Optional[List[float]] = None,
+    quality_gates: Optional[Dict[str, Any]] = None,
+    promoted_parameter_version_id: Optional[int] = None,
+) -> None:
+    conn.execute(
+        """
+        UPDATE calibration_jobs SET
+          status = ?,
+          reason = COALESCE(?, reason),
+          started_at = COALESCE(?, started_at),
+          finished_at = COALESCE(?, finished_at),
+          attempt_count = COALESCE(?, attempt_count),
+          last_error = COALESCE(?, last_error),
+          old_loss = COALESCE(?, old_loss),
+          new_loss = COALESCE(?, new_loss),
+          loss_improvement = COALESCE(?, loss_improvement),
+          old_w_json = COALESCE(?, old_w_json),
+          new_w_json = COALESCE(?, new_w_json),
+          quality_gates_json = COALESCE(?, quality_gates_json),
+          promoted_parameter_version_id = COALESCE(?, promoted_parameter_version_id)
+        WHERE id = ?;
+        """,
+        (
+            status,
+            reason,
+            int(started_at) if started_at is not None else None,
+            int(finished_at) if finished_at is not None else None,
+            int(attempt_count) if attempt_count is not None else None,
+            last_error,
+            float(old_loss) if old_loss is not None else None,
+            float(new_loss) if new_loss is not None else None,
+            float(loss_improvement) if loss_improvement is not None else None,
+            _dumps(old_w) if old_w is not None else None,
+            _dumps(new_w) if new_w is not None else None,
+            _dumps(quality_gates) if quality_gates is not None else None,
+            int(promoted_parameter_version_id) if promoted_parameter_version_id is not None else None,
+            int(job_id),
+        ),
+    )
+    conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# Phase 8: policy_score_jobs
+# ---------------------------------------------------------------------------
+
+def queue_policy_score_job_if_needed(
+    conn: sqlite3.Connection,
+    *,
+    prompt_policy_version_id: int,
+) -> Optional[int]:
+    """
+    Create a pending policy score job if no pending/running job already exists
+    for this policy. Returns the new job id, or None if not created.
+    """
+    existing = conn.execute(
+        """
+        SELECT id FROM policy_score_jobs
+        WHERE prompt_policy_version_id = ? AND status IN ('pending', 'running')
+        LIMIT 1;
+        """,
+        (int(prompt_policy_version_id),),
+    ).fetchone()
+    if existing is not None:
+        return None
+    conn.execute(
+        """
+        INSERT INTO policy_score_jobs
+          (prompt_policy_version_id, status, created_at)
+        VALUES (?, 'pending', ?);
+        """,
+        (int(prompt_policy_version_id), _utc_ts()),
+    )
+    conn.commit()
+    return int(conn.execute("SELECT last_insert_rowid();").fetchone()[0])
+
+
+def list_policy_score_jobs(
+    conn: sqlite3.Connection,
+    *,
+    status: Optional[str] = None,
+    prompt_policy_version_id: Optional[int] = None,
+    limit: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    where: List[str] = []
+    params: List[Any] = []
+    if status is not None:
+        where.append("status = ?")
+        params.append(status)
+    if prompt_policy_version_id is not None:
+        where.append("prompt_policy_version_id = ?")
+        params.append(int(prompt_policy_version_id))
+    clause = ("WHERE " + " AND ".join(where)) if where else ""
+    limit_clause = f"LIMIT {int(limit)}" if limit is not None else ""
+    rows = conn.execute(
+        f"SELECT * FROM policy_score_jobs {clause} ORDER BY created_at ASC, id ASC {limit_clause};",
+        params,
+    ).fetchall()
+    return [
+        {
+            "id": int(r["id"]),
+            "prompt_policy_version_id": int(r["prompt_policy_version_id"]),
+            "status": r["status"],
+            "reason": r["reason"],
+            "created_at": int(r["created_at"]),
+            "started_at": int(r["started_at"]) if r["started_at"] is not None else None,
+            "finished_at": int(r["finished_at"]) if r["finished_at"] is not None else None,
+            "attempt_count": int(r["attempt_count"]),
+            "last_error": r["last_error"],
+            "old_score": float(r["old_score"]) if r["old_score"] is not None else None,
+            "new_score": float(r["new_score"]) if r["new_score"] is not None else None,
+            "score_components": _loads(r["score_components_json"], None),
+        }
+        for r in rows
+    ]
+
+
+def update_policy_score_job(
+    conn: sqlite3.Connection,
+    *,
+    job_id: int,
+    status: str,
+    reason: Optional[str] = None,
+    started_at: Optional[int] = None,
+    finished_at: Optional[int] = None,
+    attempt_count: Optional[int] = None,
+    last_error: Optional[str] = None,
+    old_score: Optional[float] = None,
+    new_score: Optional[float] = None,
+    score_components: Optional[Dict[str, Any]] = None,
+) -> None:
+    conn.execute(
+        """
+        UPDATE policy_score_jobs SET
+          status = ?,
+          reason = COALESCE(?, reason),
+          started_at = COALESCE(?, started_at),
+          finished_at = COALESCE(?, finished_at),
+          attempt_count = COALESCE(?, attempt_count),
+          last_error = COALESCE(?, last_error),
+          old_score = COALESCE(?, old_score),
+          new_score = COALESCE(?, new_score),
+          score_components_json = COALESCE(?, score_components_json)
+        WHERE id = ?;
+        """,
+        (
+            status,
+            reason,
+            int(started_at) if started_at is not None else None,
+            int(finished_at) if finished_at is not None else None,
+            int(attempt_count) if attempt_count is not None else None,
+            last_error,
+            float(old_score) if old_score is not None else None,
+            float(new_score) if new_score is not None else None,
+            _dumps(score_components) if score_components is not None else None,
+            int(job_id),
+        ),
+    )
+    conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# Phase 8: policy_routing_decisions
+# ---------------------------------------------------------------------------
+
+def insert_policy_routing_decision(
+    conn: sqlite3.Connection,
+    *,
+    session_id: str,
+    prompt_policy_version_id: int,
+    routing_strategy: str,
+    decision_type: str,
+    epsilon: Optional[float],
+    n_eligible_policies: int,
+    scores_considered: Optional[List[Dict[str, Any]]],
+) -> int:
+    conn.execute(
+        """
+        INSERT INTO policy_routing_decisions
+          (session_id, prompt_policy_version_id, routing_strategy, decision_type,
+           epsilon, n_eligible_policies, scores_considered_json, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?);
+        """,
+        (
+            session_id,
+            int(prompt_policy_version_id),
+            routing_strategy,
+            decision_type,
+            float(epsilon) if epsilon is not None else None,
+            int(n_eligible_policies),
+            _dumps(scores_considered) if scores_considered is not None else None,
+            _utc_ts(),
+        ),
+    )
+    conn.commit()
+    return int(conn.execute("SELECT last_insert_rowid();").fetchone()[0])
+
+
+def list_policy_routing_decisions(
+    conn: sqlite3.Connection,
+    *,
+    session_id: Optional[str] = None,
+    prompt_policy_version_id: Optional[int] = None,
+    limit: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    where: List[str] = []
+    params: List[Any] = []
+    if session_id is not None:
+        where.append("session_id = ?")
+        params.append(session_id)
+    if prompt_policy_version_id is not None:
+        where.append("prompt_policy_version_id = ?")
+        params.append(int(prompt_policy_version_id))
+    clause = ("WHERE " + " AND ".join(where)) if where else ""
+    limit_clause = f"LIMIT {int(limit)}" if limit is not None else ""
+    rows = conn.execute(
+        f"SELECT * FROM policy_routing_decisions {clause} ORDER BY created_at DESC, id DESC {limit_clause};",
+        params,
+    ).fetchall()
+    return [
+        {
+            "id": int(r["id"]),
+            "session_id": r["session_id"],
+            "prompt_policy_version_id": int(r["prompt_policy_version_id"]),
+            "routing_strategy": r["routing_strategy"],
+            "decision_type": r["decision_type"],
+            "epsilon": float(r["epsilon"]) if r["epsilon"] is not None else None,
+            "n_eligible_policies": int(r["n_eligible_policies"]),
+            "scores_considered": _loads(r["scores_considered_json"], None),
+            "created_at": int(r["created_at"]),
+        }
+        for r in rows
+    ]
+
+
+def get_routing_enabled_policies(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
+    """Return all prompt policy versions with routing_enabled=1, newest version per name."""
+    rows = conn.execute(
+        """
+        SELECT ppv.*
+        FROM prompt_policy_versions ppv
+        INNER JOIN (
+          SELECT name, MAX(version) AS max_version
+          FROM prompt_policy_versions
+          WHERE routing_enabled = 1
+          GROUP BY name
+        ) latest ON ppv.name = latest.name AND ppv.version = latest.max_version
+        ORDER BY ppv.name ASC;
+        """
+    ).fetchall()
+    return [_ppv_row_to_dict(r) for r in rows]
+
+
+def count_routed_sessions_for_policy(
+    conn: sqlite3.Connection, prompt_policy_version_id: int
+) -> int:
+    row = conn.execute(
+        "SELECT COUNT(*) FROM policy_routing_decisions WHERE prompt_policy_version_id = ?;",
+        (int(prompt_policy_version_id),),
+    ).fetchone()
+    return int(row[0])

@@ -196,7 +196,7 @@ def generate_candidate_questions(
     seed_questions: List[dict],
     n_candidates: int = 10,
     prompt: str | None = None,
-) -> List[dict]:
+) -> Tuple[List[dict], str]:
     """
     Build prompt, call the client, parse numbered output into candidate dicts.
 
@@ -208,12 +208,14 @@ def generate_candidate_questions(
                 Used by ``render_prompt_policy`` callers (Phase 5).
 
     Returns:
-        List of ``{{"text": "..."}}`` dicts (may be fewer if parsing drops lines).
+        Tuple of (candidates, raw_response_text). ``candidates`` is a list of dicts
+        (may be fewer than n_candidates if parsing drops lines). ``raw_response_text``
+        is the raw string returned by the LLM before parsing.
     """
     if prompt is None:
         prompt = build_generation_prompt(seed_questions, n_candidates)
     raw = llm_client.complete(prompt)
-    return parse_candidate_output(raw)
+    return parse_candidate_output(raw), raw
 
 
 class DummyLLMClient:

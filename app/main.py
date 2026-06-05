@@ -77,6 +77,17 @@ LLM_MODEL = _env("LLM_MODEL", "")                   # empty string → DEFAULT_L
 _FRONTEND_ORIGINS_RAW = _env("FRONTEND_ORIGINS", "http://localhost:3000,http://localhost:5173")
 FRONTEND_ORIGINS = [o.strip() for o in _FRONTEND_ORIGINS_RAW.split(",") if o.strip()]
 
+# Phase 8: loop closure config (read by session_manager and policy_routing via os.environ).
+# Values set here become env defaults; they can be overridden by the shell environment.
+for _k, _v in [
+    ("PROMPT_POLICY_ROUTING_STRATEGY", "epsilon_greedy"),
+    ("PROMPT_POLICY_EPSILON", "0.20"),
+    ("PROMPT_POLICY_MIN_COMPLETED_SESSIONS", "10"),
+    ("CALIBRATION_MIN_RESPONSES", "50"),
+]:
+    if _k not in os.environ:
+        os.environ[_k] = _v
+
 
 app = FastAPI(title="Synchronicity Pilot Backend", version="0.1.0")
 
@@ -96,6 +107,7 @@ def _startup() -> None:
     db.seed_question_parameters(conn, QUESTIONS_PATH)
     db.seed_prompt_policies(conn, GENERIC_TEMPLATE)
     db.seed_exploratory_prompt_policies(conn)
+    db.backfill_routing_enabled(conn)  # Phase 8: ensure existing policies are routing-eligible
     conn.close()
 
 

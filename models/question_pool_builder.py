@@ -19,6 +19,7 @@ class GeneratedPoolResult:
     """Returned by build_generated_pool. Contains accepted questions plus full candidate metadata."""
     accepted: List[dict] = field(default_factory=list)
     all_candidates_metadata: List[dict] = field(default_factory=list)
+    raw_response_text: str = ""
 
 # Cosine similarity above this vs. a seed or another kept candidate counts as a near-duplicate.
 _SIM_THRESHOLD = 0.9
@@ -211,14 +212,14 @@ def build_generated_pool(
     """
     from models.question_bank import DEFAULT_NOISE_VAR, DEFAULT_THRESHOLDS
 
-    candidates = generate_candidate_questions(
+    candidates, raw_response_text = generate_candidate_questions(
         llm_client,
         seed_questions=seed_items,
         n_candidates=n_candidates,
         prompt=prompt,
     )
     if not candidates:
-        return GeneratedPoolResult(accepted=[], all_candidates_metadata=[])
+        return GeneratedPoolResult(accepted=[], all_candidates_metadata=[], raw_response_text=raw_response_text)
 
     deduped, kept_indices, all_meta = _dedupe_generated_candidates_with_meta(candidates, seed_items)
 
@@ -238,7 +239,7 @@ def build_generated_pool(
         m["calibration_status"] = "candidate"
 
     if not deduped:
-        return GeneratedPoolResult(accepted=[], all_candidates_metadata=all_meta)
+        return GeneratedPoolResult(accepted=[], all_candidates_metadata=all_meta, raw_response_text=raw_response_text)
 
     assigned = assign_w_to_candidates(deduped, seed_items, k=k)
 
@@ -278,7 +279,7 @@ def build_generated_pool(
             )
 
     accepted = [_normalize_question_dict(row) for row in valid]
-    return GeneratedPoolResult(accepted=accepted, all_candidates_metadata=all_meta)
+    return GeneratedPoolResult(accepted=accepted, all_candidates_metadata=all_meta, raw_response_text=raw_response_text)
 
 
 def build_session_inference_pool(

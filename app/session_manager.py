@@ -17,6 +17,7 @@ import numpy as np
 
 from app import db
 from models.personality_state import PersonalityState
+from models.policy_routing import select_prompt_policy_for_session
 from models.question_bank import DEFAULT_THRESHOLDS, Question, load_question_pools_v2
 from models.prompt_policy import PromptPolicy, render_prompt_policy
 from models.question_generation import DEFAULT_LLM_MODEL, make_llm_client
@@ -30,6 +31,8 @@ from models.session_experiment import assign_experiment_arm, should_use_generate
 Mode = Literal["adaptive", "fixed_order"]
 Status = Literal["inference", "heldout", "complete"]
 SessionStrategy = Literal["classic_eig", "anchored_exploratory"]
+
+SELECTION_LOG_TOP_K = 5
 
 
 class _AtomicConn:
@@ -166,6 +169,33 @@ def _qmap_with_session_inference(sess: db.SessionRow, questions_v2_path: str, di
     return qmap
 
 
+def _queue_calibration_jobs_for_session(conn, sess: db.SessionRow) -> None:
+    """Queue calibration jobs for any inference question that has crossed the threshold."""
+    import os
+    min_responses = int(os.environ.get("CALIBRATION_MIN_RESPONSES", "50"))
+    for qid in sess.asked_ids:
+        try:
+            db.queue_calibration_job_if_eligible(conn, question_id=qid, min_responses=min_responses)
+        except Exception as exc:  # noqa: BLE001
+            import warnings
+            warnings.warn(f"Failed to queue calibration job for {qid}: {exc}", stacklevel=2)
+
+
+def _queue_policy_score_job_for_session(conn, session_id: str) -> None:
+    """Queue a policy score refresh for the policy linked to this session."""
+    try:
+        requests = db.list_llm_generation_requests_for_session(conn, session_id)
+        seen: set = set()
+        for req in requests:
+            pid = req.get("prompt_policy_version_id")
+            if pid is not None and pid not in seen:
+                seen.add(pid)
+                db.queue_policy_score_job_if_needed(conn, prompt_policy_version_id=int(pid))
+    except Exception as exc:  # noqa: BLE001
+        import warnings
+        warnings.warn(f"Failed to queue policy score job for session {session_id}: {exc}", stacklevel=2)
+
+
 def _finalize_heldout_evaluation_if_needed(
     conn,
     *,
@@ -221,6 +251,12 @@ def _finalize_heldout_evaluation_if_needed(
             sigma=sess.posterior_sigma,
             entropy=float(final_state.entropy()),
         )
+
+    # Phase 8: queue calibration jobs for questions that crossed the response threshold.
+    _queue_calibration_jobs_for_session(conn, sess)
+
+    # Phase 8: queue a policy score refresh for the policy that served this session.
+    _queue_policy_score_job_for_session(conn, session_id)
 
 
 def load_bank(
@@ -301,7 +337,10 @@ def create_session(
     generation_error: Optional[str] = None
 
     if use_generated:
-        _policy_row = db.get_active_prompt_policy_version(conn)
+        # Phase 8: epsilon-greedy routing selects among routing-enabled policies.
+        # session_id is not yet in the DB, so we pass it for the routing log only;
+        # the FK constraint will be satisfied when insert_session runs below.
+        _policy_row = select_prompt_policy_for_session(conn, session_id=session_id)
         if _policy_row is not None:
             policy_version_id = int(_policy_row["id"])
             rendered_prompt = render_prompt_policy(
@@ -315,6 +354,7 @@ def create_session(
             client = llm_client
         else:
             client = make_llm_client(api_key=llm_api_key, model=llm_model)
+        raw_llm_response: Optional[str] = None
         try:
             gen_result = build_generated_pool(
                 client,
@@ -330,6 +370,7 @@ def create_session(
                 d["calibration_status"] = str(d.get("calibration_status") or "accepted_uncalibrated")
             generated_candidates_metadata = gen_result.all_candidates_metadata
             n_returned = len(generated_candidates_metadata)
+            raw_llm_response = gen_result.raw_response_text or None
         except Exception as exc:  # noqa: BLE001
             import warnings
             warnings.warn(
@@ -454,6 +495,7 @@ def create_session(
                 n_returned=n_returned,
                 status=generation_status,
                 error_message=generation_error,
+                raw_response_text=raw_llm_response,
             )
         except Exception as exc:  # noqa: BLE001
             import warnings
@@ -545,13 +587,14 @@ def get_next_question(
                     min_anchor = int(first.get("min_anchor_questions") or 0)
                     max_generated = int(first.get("max_generated_probes") or max_generated)
 
+                q_metadata = _session_question_metadata(sess)
                 if strategy == "anchored_exploratory":
                     best, best_score, ranked = select_next_question_exploratory(
                         state,
                         inference_questions,
                         asked_ids=asked,
                         generated_question_ids=set(sess.generated_question_ids),
-                        question_metadata=_session_question_metadata(sess),
+                        question_metadata=q_metadata,
                         composition=SessionComposition.scaled(
                             sess.max_inference_questions,
                             min_anchor_questions=min_anchor or 2,
@@ -563,8 +606,13 @@ def get_next_question(
                     if ranked:
                         _, _, best_components = ranked[0]
                         best_eig = float(best_components.get("expected_information_gain", best_score))
+                    # ranked: List[Tuple[Question, float, Dict[str, float]]]
+                    _alt_ranked = [
+                        (q, score, comps) for q, score, comps in ranked[1:SELECTION_LOG_TOP_K]
+                    ]
+                    _alt_eig_mode = False
                 else:
-                    best, best_eig, _ = select_next_question_eig(state, inference_questions, asked_ids=asked)
+                    best, best_eig, _eig_ranked = select_next_question_eig(state, inference_questions, asked_ids=asked)
                     best_components = {
                         "selection_score": float(best_eig),
                         "expected_information_gain": float(best_eig),
@@ -574,22 +622,46 @@ def get_next_question(
                         "redundancy_penalty": 0.0,
                         "risk_penalty": 0.0,
                     }
+                    # _eig_ranked: List[Tuple[Question, float]]
+                    _alt_ranked = [
+                        (q, eig, {
+                            "selection_score": float(eig),
+                            "expected_information_gain": float(eig),
+                        })
+                        for q, eig in _eig_ranked[1:SELECTION_LOG_TOP_K]
+                    ]
+                    _alt_eig_mode = True
                 if best is None:
                     db.update_session_state(conn, session_id=session_id, status="heldout")
                     return get_next_question(conn, questions_v2_path=questions_v2_path, session_id=session_id, dim=dim)
                 db.update_pending_selection(
                     conn, session_id=session_id, question_id=best.id, eig=float(best_eig)
                 )
-                db.insert_selection_score_log(
-                    conn,
-                    session_id=session_id,
-                    step_idx=sess.step,
-                    question_id=best.id,
-                    question_source=_question_source(best.id, sess),
-                    components=best_components,
-                    calibration_status=_session_question_metadata(sess).get(best.id, {}).get("calibration_status"),
-                    selected=True,
-                )
+                # Deduplicate: skip logging if this step was already logged (repeated get_next_question call).
+                if not db.has_selection_score_log(conn, session_id, sess.step):
+                    db.insert_selection_score_log(
+                        conn,
+                        session_id=session_id,
+                        step_idx=sess.step,
+                        question_id=best.id,
+                        question_source=_question_source(best.id, sess),
+                        components=best_components,
+                        calibration_status=q_metadata.get(best.id, {}).get("calibration_status"),
+                        selected=True,
+                        candidate_rank=0,
+                    )
+                    for _rank, (_alt_q, _alt_score, _alt_comps) in enumerate(_alt_ranked, start=1):
+                        db.insert_selection_score_log(
+                            conn,
+                            session_id=session_id,
+                            step_idx=sess.step,
+                            question_id=_alt_q.id,
+                            question_source=_question_source(_alt_q.id, sess),
+                            components=_alt_comps,
+                            calibration_status=q_metadata.get(_alt_q.id, {}).get("calibration_status"),
+                            selected=False,
+                            candidate_rank=_rank,
+                        )
                 return _question_payload(best, pool="inference")
 
             # fixed_order
@@ -750,11 +822,14 @@ def record_answer(
             # Phase 4+6: use the parameter version frozen at session creation, not the
             # currently active version. This prevents scientific drift when parameters are
             # re-estimated after the session pool was built.
+            # Phase 9: also read calibration_status from the frozen pool dict.
             pool_param_version: Optional[int] = None
+            pool_calibration_status: Optional[str] = None
             if sess.inference_pool:
                 for _d in sess.inference_pool:
                     if str(_d.get("id")) == question_id:
                         pool_param_version = _d.get("param_version")
+                        pool_calibration_status = _d.get("calibration_status") or None
                         break
 
             # Phase 6: direct lineage — resolve generated_candidate_id and linked request/policy.
@@ -771,6 +846,7 @@ def record_answer(
                     gen_cand_policy_version_id = _gen_cand.get("prompt_policy_version_id")
 
             # Phase 2+6: performance event with direct lineage fields.
+            # Phase 9: pass calibration_status from the frozen pool dict.
             db.insert_question_performance_event(
                 txn,
                 question_id=question_id,
@@ -791,6 +867,7 @@ def record_answer(
                 generated_candidate_id=generated_candidate_id,
                 generation_request_id=gen_cand_request_id,
                 prompt_policy_version_id=gen_cand_policy_version_id,
+                calibration_status=pool_calibration_status,
             )
 
             # Phase 3: mark generated question as selected at this step.
