@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from 'react'
-import { registerUser, startSession, submitAnswer, getSessionSummary } from './api'
+import { registerUser, startSession, submitAnswer, getSessionSummary, getSessionNarrative } from './api'
 import QuestionCard from './components/QuestionCard'
 import SummaryPage from './components/SummaryPage'
 
@@ -14,6 +14,8 @@ export default function App() {
   const [question, setQuestion] = useState(null)
   const [questionNumber, setQuestionNumber] = useState(1)
   const [summary, setSummary] = useState(null)
+  const [narrative, setNarrative] = useState(null)
+  const [narrativeLoading, setNarrativeLoading] = useState(false)
   const [error, setError] = useState(null)
   const [submitting, setSubmitting] = useState(false)
 
@@ -21,6 +23,8 @@ export default function App() {
     setPhase('init')
     setError(null)
     setSummary(null)
+    setNarrative(null)
+    setNarrativeLoading(false)
     setQuestionNumber(1)
     try {
       let userId = localStorage.getItem(USER_ID_KEY)
@@ -69,6 +73,12 @@ export default function App() {
         const summaryData = await getSessionSummary(sessionId)
         setSummary(summaryData)
         setPhase('complete')
+        // Fetch narrative in parallel — loading state shown in SummaryPage
+        setNarrativeLoading(true)
+        getSessionNarrative(sessionId)
+          .then((nd) => setNarrative(nd.narrative))
+          .catch(() => setNarrative(null))
+          .finally(() => setNarrativeLoading(false))
       } else {
         setQuestion(data.next_question)
         setQuestionNumber((n) => n + 1)
@@ -108,7 +118,12 @@ export default function App() {
   if (phase === 'complete') {
     return (
       <div className="app">
-        <SummaryPage summary={summary} onRestart={initSession} />
+        <SummaryPage
+          summary={summary}
+          narrative={narrative}
+          narrativeLoading={narrativeLoading}
+          onRestart={initSession}
+        />
       </div>
     )
   }

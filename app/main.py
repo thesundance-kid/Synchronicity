@@ -20,7 +20,7 @@ import sqlite3
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -28,11 +28,13 @@ from app import db
 from app.session_manager import (
     Mode,
     create_session,
+    generate_step_candidates_bg,
     get_next_question,
     get_question_num_categories,
     get_session_summary,
     record_answer,
 )
+from models.narrative import generate_narrative
 from models.prompt_policy import GENERIC_TEMPLATE
 
 
@@ -135,7 +137,7 @@ class StartSessionResponse(BaseModel):
 
 
 @app.post("/start_session", response_model=StartSessionResponse)
-def start_session(req: StartSessionRequest) -> StartSessionResponse:
+def start_session(req: StartSessionRequest, background_tasks: BackgroundTasks) -> StartSessionResponse:
     conn = db.connect(DB_PATH)
     db.init_db(conn)
     try:
@@ -165,6 +167,17 @@ def start_session(req: StartSessionRequest) -> StartSessionResponse:
             session_strategy=req.session_strategy,
             max_anchor_questions=req.max_anchor_questions,
             max_generated_probes=req.max_generated_probes,
+        )
+        # Pre-generate candidates for step 1 while user reads the first question.
+        background_tasks.add_task(
+            generate_step_candidates_bg,
+            session_id,
+            1,
+            DB_PATH,
+            QUESTIONS_PATH,
+            ANTHROPIC_API_KEY or None,
+            LLM_MODEL or None,
+            LATENT_DIM,
         )
         return StartSessionResponse(session_id=session_id, first_question=QuestionModel(**first_q.__dict__))
     except HTTPException:
@@ -201,7 +214,7 @@ class AnswerRequest(BaseModel):
 
 
 @app.post("/answer")
-def answer(req: AnswerRequest):
+def answer(req: AnswerRequest, background_tasks: BackgroundTasks):
     conn = db.connect(DB_PATH)
     db.init_db(conn)
     try:
@@ -219,7 +232,7 @@ def answer(req: AnswerRequest):
                 status_code=422,
                 detail=f"response must be between 1 and {num_cat} (question has {num_cat} categories)",
             )
-        return record_answer(
+        result = record_answer(
             conn,
             questions_v2_path=QUESTIONS_PATH,
             session_id=req.session_id,
@@ -227,6 +240,21 @@ def answer(req: AnswerRequest):
             response=req.response,
             dim=LATENT_DIM,
         )
+        # Schedule per-step candidate pre-generation for the next-next selection step.
+        if result.get("status") == "inference":
+            sess_after = db.get_session(conn, req.session_id)
+            next_for_step = sess_after.step + 1
+            background_tasks.add_task(
+                generate_step_candidates_bg,
+                req.session_id,
+                next_for_step,
+                DB_PATH,
+                QUESTIONS_PATH,
+                ANTHROPIC_API_KEY or None,
+                LLM_MODEL or None,
+                LATENT_DIM,
+            )
+        return result
     except HTTPException:
         raise
     except sqlite3.IntegrityError:
@@ -313,6 +341,66 @@ def get_posterior_history(session_id: str):
         return {"session_id": session_id, "snapshots": snapshots}
     except KeyError:
         raise HTTPException(status_code=404, detail="Session not found")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    finally:
+        conn.close()
+
+
+@app.get("/session/{session_id}/narrative")
+def get_session_narrative(session_id: str):
+    """
+    Return (or generate on first call) a user-facing LLM narrative portrait.
+
+    - 404 if the session does not exist.
+    - 400 if the session is not yet complete.
+    - Returns cached narrative_text if already generated.
+    - Calls LLM once on first hit, then caches in sessions.narrative_text.
+    """
+    conn = db.connect(DB_PATH)
+    db.init_db(conn)
+    try:
+        try:
+            sess = db.get_session(conn, session_id)
+        except KeyError:
+            raise HTTPException(status_code=404, detail="Session not found")
+
+        if sess.status != "complete":
+            raise HTTPException(
+                status_code=400,
+                detail="Session is not yet complete. Narrative is only available after all questions are answered.",
+            )
+
+        # Return cached narrative if available.
+        if sess.narrative_text is not None:
+            return {"session_id": session_id, "narrative": sess.narrative_text, "cached": True}
+
+        # Generate narrative on first request.
+        from app.session_manager import _qmap_with_session_inference, _build_response_history_for_sketch
+        qmap = _qmap_with_session_inference(sess, QUESTIONS_PATH, LATENT_DIM)
+        responses = db.list_responses(conn, session_id)
+        history = _build_response_history_for_sketch(responses, qmap)
+
+        from models.question_generation import make_llm_client, DummyLLMClient
+        try:
+            client = make_llm_client(api_key=ANTHROPIC_API_KEY or None, model=LLM_MODEL or None)
+        except Exception:
+            client = DummyLLMClient()
+        narrative = generate_narrative(
+            response_history=history,
+            character_sketch=sess.latest_character_sketch,
+            llm_client=client,
+        )
+
+        try:
+            db.update_session_narrative(conn, session_id, narrative)
+        except Exception as _exc:
+            import warnings
+            warnings.warn(f"Failed to cache narrative for {session_id}: {_exc}", stacklevel=2)
+
+        return {"session_id": session_id, "narrative": narrative, "cached": False}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     finally:

@@ -82,7 +82,7 @@ Generate exactly {n_candidates} new candidate questions. Each question must be:
 
 Seed questions (do not repeat or closely mimic these):
 {seeds_block}
-
+{sketch_block}
 Output format:
 Return only a JSON array. Each item must have:
 - "text": the question text
@@ -174,6 +174,7 @@ def render_prompt_policy(
     question_history_summary: Optional[Dict[str, Any]] = None,
     answer_history_summary: Optional[Dict[str, Any]] = None,
     unresolved_tensions: Optional[Dict[str, Any]] = None,
+    character_sketch: Optional[str] = None,
 ) -> str:
     """
     Render the policy's prompt template with the given context.
@@ -181,6 +182,7 @@ def render_prompt_policy(
     Placeholders supported in templates (all optional; missing keys render as ""):
       {n_candidates}             how many candidates to request
       {seeds_block}              numbered list of seed question texts
+      {sketch_block}             behavioral portrait of the respondent (omitted if empty)
       {posterior_context}        trait-estimate summary (posterior_only and richer modes)
       {uncertainty_context}      entropy/variance summary (posterior_only and richer modes)
       {question_history_context} prior question history (future)
@@ -190,6 +192,18 @@ def render_prompt_policy(
     Uses defaultdict so templates with unknown or future placeholders degrade gracefully.
     """
     seeds_block = _build_seeds_block(seed_questions)
+
+    # Build sketch_block only when we have a non-empty sketch.
+    sketch = (character_sketch or "").strip()
+    if sketch:
+        sketch_block = (
+            "\nCURRENT UNDERSTANDING OF THIS PERSON:\n"
+            + sketch
+            + "\n\nUse this understanding to generate questions that probe what remains "
+            "uncertain or underexplored about this person.\n"
+        )
+    else:
+        sketch_block = ""
 
     mode = policy.conditioning_mode
     posterior_context = ""
@@ -211,6 +225,7 @@ def render_prompt_policy(
     context: Dict[str, Any] = defaultdict(str, {
         "n_candidates": str(n_candidates),
         "seeds_block": seeds_block,
+        "sketch_block": sketch_block,
         "posterior_context": posterior_context,
         "uncertainty_context": uncertainty_context,
         "question_history_context": question_history_context,

@@ -58,6 +58,9 @@ class SessionRow:
     # Phase 1: anonymous users and longitudinal state
     user_id: Optional[str]
     prior_session_id: Optional[str]
+    # Sketch + narrative (nullable; added via migration)
+    latest_character_sketch: Optional[str] = None
+    narrative_text: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -188,6 +191,20 @@ def _migrate_sessions_user(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE sessions ADD COLUMN prior_session_id TEXT;")
 
 
+def _migrate_sessions_sketch_narrative(conn: sqlite3.Connection) -> None:
+    """Add character sketch and narrative cache columns to sessions (idempotent)."""
+    info = conn.execute("PRAGMA table_info(sessions);").fetchall()
+    col_names = {row[1] for row in info}
+    if "latest_character_sketch" not in col_names:
+        conn.execute("ALTER TABLE sessions ADD COLUMN latest_character_sketch TEXT;")
+    if "latest_sketch_step_idx" not in col_names:
+        conn.execute("ALTER TABLE sessions ADD COLUMN latest_sketch_step_idx INTEGER;")
+    if "narrative_text" not in col_names:
+        conn.execute("ALTER TABLE sessions ADD COLUMN narrative_text TEXT;")
+    if "narrative_generated_at" not in col_names:
+        conn.execute("ALTER TABLE sessions ADD COLUMN narrative_generated_at INTEGER;")
+
+
 def _migrate_sessions_v2(conn: sqlite3.Connection) -> None:
     """Add V2-lite columns to existing databases."""
     info = conn.execute("PRAGMA table_info(sessions);").fetchall()
@@ -255,6 +272,7 @@ def init_db(conn: sqlite3.Connection) -> None:
     )
     _migrate_sessions_v2(conn)
     _migrate_sessions_user(conn)
+    _migrate_sessions_sketch_narrative(conn)
 
     conn.execute(
         """
@@ -649,6 +667,35 @@ def init_db(conn: sqlite3.Connection) -> None:
     )
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_routing_decisions_policy ON policy_routing_decisions(prompt_policy_version_id);"
+    )
+
+    # Per-step pre-generated candidate cache (background task staging table).
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS step_candidates_cache (
+          id                     INTEGER PRIMARY KEY AUTOINCREMENT,
+          session_id             TEXT    NOT NULL,
+          for_step_idx           INTEGER NOT NULL,
+          question_id            TEXT    NOT NULL,
+          text                   TEXT    NOT NULL,
+          w_json                 TEXT    NOT NULL,
+          noise_var              REAL    NOT NULL,
+          thresholds_json        TEXT    NOT NULL,
+          nn_seed_ids_json       TEXT,
+          nn_similarities_json   TEXT,
+          sketch_mu_json         TEXT,
+          sketch_sigma_json      TEXT,
+          character_sketch       TEXT,
+          status                 TEXT    NOT NULL DEFAULT 'ready',
+          generation_request_id  INTEGER,
+          created_at             INTEGER NOT NULL,
+          UNIQUE(session_id, for_step_idx, question_id),
+          FOREIGN KEY(session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
+        );
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_scc_session_step ON step_candidates_cache(session_id, for_step_idx);"
     )
 
     conn.commit()
@@ -1049,6 +1096,16 @@ def get_session(conn: sqlite3.Connection, session_id: str) -> SessionRow:
         if "prior_session_id" in keys and row["prior_session_id"] is not None
         else None
     )
+    latest_character_sketch = (
+        str(row["latest_character_sketch"])
+        if "latest_character_sketch" in keys and row["latest_character_sketch"] is not None
+        else None
+    )
+    narrative_text = (
+        str(row["narrative_text"])
+        if "narrative_text" in keys and row["narrative_text"] is not None
+        else None
+    )
 
     return SessionRow(
         session_id=row["session_id"],
@@ -1073,6 +1130,8 @@ def get_session(conn: sqlite3.Connection, session_id: str) -> SessionRow:
         pending_eig=pending_eig,
         user_id=user_id,
         prior_session_id=prior_session_id,
+        latest_character_sketch=latest_character_sketch,
+        narrative_text=narrative_text,
     )
 
 
@@ -2589,3 +2648,192 @@ def count_routed_sessions_for_policy(
         (int(prompt_policy_version_id),),
     ).fetchone()
     return int(row[0])
+
+
+# ---------------------------------------------------------------------------
+# Step-candidate cache (per-step background pre-generation)
+# ---------------------------------------------------------------------------
+
+def insert_step_candidate(
+    conn: sqlite3.Connection,
+    *,
+    session_id: str,
+    for_step_idx: int,
+    question_id: str,
+    text: str,
+    w: List[float],
+    noise_var: float,
+    thresholds: List[float],
+    nn_seed_ids: Optional[List[str]] = None,
+    nn_similarities: Optional[List[float]] = None,
+    sketch_mu: Optional[List[float]] = None,
+    sketch_sigma: Optional[List[List[float]]] = None,
+    character_sketch: Optional[str] = None,
+    generation_request_id: Optional[int] = None,
+) -> None:
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO step_candidates_cache
+          (session_id, for_step_idx, question_id, text, w_json, noise_var,
+           thresholds_json, nn_seed_ids_json, nn_similarities_json,
+           sketch_mu_json, sketch_sigma_json, character_sketch,
+           status, generation_request_id, created_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,'ready',?,?);
+        """,
+        (
+            session_id,
+            int(for_step_idx),
+            question_id,
+            text,
+            _dumps(w),
+            float(noise_var),
+            _dumps(thresholds),
+            _dumps(nn_seed_ids) if nn_seed_ids is not None else None,
+            _dumps(nn_similarities) if nn_similarities is not None else None,
+            _dumps(sketch_mu) if sketch_mu is not None else None,
+            _dumps(sketch_sigma) if sketch_sigma is not None else None,
+            character_sketch,
+            int(generation_request_id) if generation_request_id is not None else None,
+            _utc_ts(),
+        ),
+    )
+    conn.commit()
+
+
+def get_step_candidates(
+    conn: sqlite3.Connection,
+    session_id: str,
+    for_step_idx: int,
+    statuses: Tuple[str, ...] = ("ready",),
+) -> List[Dict[str, Any]]:
+    placeholders = ",".join("?" * len(statuses))
+    rows = conn.execute(
+        f"""
+        SELECT id, session_id, for_step_idx, question_id, text,
+               w_json, noise_var, thresholds_json,
+               nn_seed_ids_json, nn_similarities_json,
+               sketch_mu_json, sketch_sigma_json, character_sketch,
+               status, generation_request_id, created_at
+        FROM step_candidates_cache
+        WHERE session_id = ? AND for_step_idx = ? AND status IN ({placeholders})
+        ORDER BY id ASC;
+        """,
+        (session_id, int(for_step_idx)) + tuple(statuses),
+    ).fetchall()
+    out = []
+    for r in rows:
+        out.append(
+            {
+                "id": r["id"],
+                "session_id": r["session_id"],
+                "for_step_idx": r["for_step_idx"],
+                "question_id": r["question_id"],
+                "text": r["text"],
+                "w": _loads(r["w_json"], []),
+                "noise_var": float(r["noise_var"]),
+                "thresholds": _loads(r["thresholds_json"], []),
+                "nn_seed_ids": _loads(r["nn_seed_ids_json"], None),
+                "nn_similarities": _loads(r["nn_similarities_json"], None),
+                "sketch_mu": _loads(r["sketch_mu_json"], None),
+                "sketch_sigma": _loads(r["sketch_sigma_json"], None),
+                "character_sketch": r["character_sketch"],
+                "status": r["status"],
+                "generation_request_id": r["generation_request_id"],
+                "created_at": r["created_at"],
+            }
+        )
+    return out
+
+
+def step_candidates_exist(
+    conn: sqlite3.Connection, session_id: str, for_step_idx: int
+) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM step_candidates_cache WHERE session_id = ? AND for_step_idx = ? LIMIT 1;",
+        (session_id, int(for_step_idx)),
+    ).fetchone()
+    return row is not None
+
+
+def update_step_candidate_status(
+    conn: sqlite3.Connection,
+    session_id: str,
+    for_step_idx: int,
+    question_id: str,
+    status: str,
+) -> None:
+    conn.execute(
+        """
+        UPDATE step_candidates_cache
+        SET status = ?
+        WHERE session_id = ? AND for_step_idx = ? AND question_id = ?;
+        """,
+        (status, session_id, int(for_step_idx), question_id),
+    )
+    conn.commit()
+
+
+def add_candidate_to_session_pool(
+    conn: sqlite3.Connection,
+    *,
+    session_id: str,
+    candidate_dict: Dict[str, Any],
+    new_generated_id: str,
+) -> None:
+    """Append a step-cache candidate to inference_pool_json and generated_question_ids_json."""
+    row = conn.execute(
+        "SELECT inference_pool_json, generated_question_ids_json FROM sessions WHERE session_id = ?;",
+        (session_id,),
+    ).fetchone()
+    if row is None:
+        raise KeyError(f"Session not found: {session_id}")
+    pool: List[Any] = _loads(row["inference_pool_json"], []) or []
+    gen_ids: List[str] = _loads(row["generated_question_ids_json"], []) or []
+    existing = {str(d.get("id")) for d in pool}
+    if str(candidate_dict.get("id")) not in existing:
+        pool.append(candidate_dict)
+    if new_generated_id not in gen_ids:
+        gen_ids.append(new_generated_id)
+    conn.execute(
+        """
+        UPDATE sessions
+        SET inference_pool_json = ?,
+            generated_question_ids_json = ?,
+            updated_at = ?
+        WHERE session_id = ?;
+        """,
+        (_dumps(pool), _dumps(gen_ids), _utc_ts(), session_id),
+    )
+    conn.commit()
+
+
+def update_session_sketch(
+    conn: sqlite3.Connection, session_id: str, sketch: str, step_idx: int
+) -> None:
+    conn.execute(
+        """
+        UPDATE sessions
+        SET latest_character_sketch = ?,
+            latest_sketch_step_idx = ?,
+            updated_at = ?
+        WHERE session_id = ?;
+        """,
+        (sketch, int(step_idx), _utc_ts(), session_id),
+    )
+    conn.commit()
+
+
+def update_session_narrative(
+    conn: sqlite3.Connection, session_id: str, narrative: str
+) -> None:
+    conn.execute(
+        """
+        UPDATE sessions
+        SET narrative_text = ?,
+            narrative_generated_at = ?,
+            updated_at = ?
+        WHERE session_id = ?;
+        """,
+        (narrative, _utc_ts(), _utc_ts(), session_id),
+    )
+    conn.commit()

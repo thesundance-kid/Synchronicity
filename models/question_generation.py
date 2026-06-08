@@ -236,8 +236,9 @@ class DummyLLMClient:
 10. Do you tend to reflect on your day before going to sleep?"""
 
     def complete(self, prompt: str) -> str:
-        _ = prompt  # API-compatible; dummy ignores prompt
-        return self._HARDCODED
+        if "JSON array" in prompt:
+            return self._HARDCODED
+        return "No profile available — running without LLM."
 
 
 class AnthropicLLMClient:

@@ -41,3 +41,7 @@ export function submitAnswer(sessionId, questionId, response) {
 export function getSessionSummary(sessionId) {
   return request(`/session_summary/${sessionId}`)
 }
+
+export function getSessionNarrative(sessionId) {
+  return request(`/session/${sessionId}/narrative`)
+}

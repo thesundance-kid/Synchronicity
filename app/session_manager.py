@@ -16,6 +16,7 @@ from typing import Any, Dict, List, Literal, Optional, Sequence, Set, Tuple
 import numpy as np
 
 from app import db
+from models.character_sketch import generate_character_sketch
 from models.personality_state import PersonalityState
 from models.policy_routing import select_prompt_policy_for_session
 from models.question_bank import DEFAULT_THRESHOLDS, Question, load_question_pools_v2
@@ -159,14 +160,96 @@ def _session_question_metadata(sess: db.SessionRow) -> Dict[str, Dict[str, Any]]
     return metadata
 
 
-def _qmap_with_session_inference(sess: db.SessionRow, questions_v2_path: str, dim: int) -> Dict[str, Question]:
+def _qmap_with_session_inference(
+    sess: db.SessionRow,
+    questions_v2_path: str,
+    dim: int,
+    extra_questions: Optional[List[Question]] = None,
+) -> Dict[str, Question]:
     """Question id map including held-out from file and session inference items (incl. generated)."""
     _, _, qmap = load_bank(questions_v2_path, expected_dim=dim)
     if sess.inference_pool:
         for d in sess.inference_pool:
             q = _dict_to_question(d)
             qmap[q.id] = q
+    if extra_questions:
+        for q in extra_questions:
+            qmap[q.id] = q
     return qmap
+
+
+def _build_response_history_for_sketch(
+    responses: List[db.ResponseRow],
+    qmap: Dict[str, Question],
+) -> List[Dict[str, Any]]:
+    """Build inference response history for character sketch generation."""
+    history = []
+    for r in responses:
+        if r.pool != "inference":
+            continue
+        q = qmap.get(r.question_id)
+        history.append({
+            "question_id": r.question_id,
+            "text": q.text if q is not None else r.question_id,
+            "response": int(r.response),
+            "step": int(r.step),
+        })
+    return sorted(history, key=lambda x: x["step"])
+
+
+def _load_and_merge_step_candidates(
+    conn,
+    sess: db.SessionRow,
+    dim: int,
+) -> Tuple[List[Question], Set[str], List[Dict[str, Any]]]:
+    """
+    Load pre-generated step candidates from the cache for the current selection step.
+    Returns (questions, question_id_set, candidate_dicts_for_pool).
+    """
+    rows = db.get_step_candidates(conn, sess.session_id, sess.step)
+    if not rows:
+        return [], set(), []
+
+    questions: List[Question] = []
+    ids: Set[str] = set()
+    dicts: List[Dict[str, Any]] = []
+    for row in rows:
+        try:
+            w = np.asarray(row["w"], dtype=np.float64).reshape(-1)
+            thr = np.asarray(row["thresholds"], dtype=np.float64).reshape(-1)
+            q = Question(
+                id=row["question_id"],
+                text=row["text"],
+                w=w,
+                noise_var=float(row["noise_var"]),
+                thresholds=thr,
+            )
+            questions.append(q)
+            ids.add(q.id)
+            pool_dict: Dict[str, Any] = {
+                "id": row["question_id"],
+                "text": row["text"],
+                "w": w.tolist(),
+                "noise_var": float(row["noise_var"]),
+                "thresholds": thr.tolist(),
+                "source": "generated",
+                "calibration_status": "accepted_uncalibrated",
+                "param_version": None,
+            }
+            if sess.inference_pool:
+                first_d = sess.inference_pool[0]
+                if first_d.get("session_strategy"):
+                    pool_dict["session_strategy"] = first_d["session_strategy"]
+                    pool_dict["min_anchor_questions"] = first_d.get("min_anchor_questions", 2)
+                    pool_dict["max_generated_probes"] = first_d.get("max_generated_probes", 6)
+            dicts.append(pool_dict)
+        except Exception as exc:  # noqa: BLE001
+            import warnings
+            warnings.warn(
+                f"Failed to load step candidate {row.get('question_id', '?')}: {exc}",
+                stacklevel=2,
+            )
+    return questions, ids, dicts
 
 
 def _queue_calibration_jobs_for_session(conn, sess: db.SessionRow) -> None:
@@ -322,6 +405,33 @@ def create_session(
     seed_stored = [_question_to_stored_dict(q) for q in inference_seed]
     seeds_for_generation = [{"id": q.id, "text": q.text, "w": q.w} for q in inference_seed]
 
+    # Phase 1: warm-start from user_current_state if available; otherwise flat prior.
+    # Moved before LLM call so the sketch can condition question generation.
+    prior_session_id: Optional[str] = None
+    if user_id is not None:
+        warm = db.get_user_current_state(conn, user_id)
+        if warm is not None:
+            state = _state_from_jsonable(warm["mu"], warm["sigma"])
+            prior_session_id = warm["latest_session_id"]
+        else:
+            state = PersonalityState(dim=dim)
+    else:
+        state = PersonalityState(dim=dim)
+
+    # Generate a prior character sketch to condition question generation.
+    # Wrapped in try-except: make_llm_client() can raise ImportError when the
+    # anthropic package is absent even if an API key env var is set.
+    try:
+        if llm_client is not None:
+            _sketch_client = llm_client
+        else:
+            _sketch_client = make_llm_client(api_key=llm_api_key, model=llm_model)
+        prior_sketch = generate_character_sketch(state, [], _sketch_client)
+    except Exception as _exc:  # noqa: BLE001
+        import warnings
+        warnings.warn(f"Prior sketch generation failed (omitted): {_exc}", stacklevel=2)
+        prior_sketch = ""
+
     use_generated = should_use_generated_questions(arm) or session_strategy == "anchored_exploratory"
     generated_stored: Optional[List[Dict[str, Any]]] = None
     generated_candidates_metadata: Optional[List[Dict[str, Any]]] = None
@@ -348,14 +458,15 @@ def create_session(
                 seeds_for_generation,
                 n_generation_candidates,
                 uncertainty_summary=None,
+                character_sketch=prior_sketch,
             )
 
-        if llm_client is not None:
-            client = llm_client
-        else:
-            client = make_llm_client(api_key=llm_api_key, model=llm_model)
         raw_llm_response: Optional[str] = None
         try:
+            if llm_client is not None:
+                client = llm_client
+            else:
+                client = make_llm_client(api_key=llm_api_key, model=llm_model)
             gen_result = build_generated_pool(
                 client,
                 seeds_for_generation,
@@ -419,18 +530,6 @@ def create_session(
     rng.shuffle(heldout_ids)
     heldout_ids = heldout_ids[:num_heldout]
 
-    # Phase 1: warm-start from user_current_state if available; otherwise flat prior.
-    prior_session_id: Optional[str] = None
-    if user_id is not None:
-        warm = db.get_user_current_state(conn, user_id)
-        if warm is not None:
-            state = _state_from_jsonable(warm["mu"], warm["sigma"])
-            prior_session_id = warm["latest_session_id"]
-        else:
-            state = PersonalityState(dim=dim)
-    else:
-        state = PersonalityState(dim=dim)
-
     mu, sigma = _state_to_jsonable(state)
     initial_entropy = float(state.entropy())
 
@@ -464,6 +563,13 @@ def create_session(
         sigma=sigma,
         entropy=initial_entropy,
     )
+
+    # Cache the prior sketch in the session row for later retrieval.
+    try:
+        db.update_session_sketch(conn, session_id, prior_sketch, step_idx=0)
+    except Exception as _exc:  # noqa: BLE001
+        import warnings
+        warnings.warn(f"Failed to cache prior sketch for {session_id}: {_exc}", stacklevel=2)
 
     # Phase 5: log the LLM generation request (always when use_generated, even on failure).
     # Session must exist in DB before inserting this row (FK constraint).
@@ -587,13 +693,35 @@ def get_next_question(
                     min_anchor = int(first.get("min_anchor_questions") or 0)
                     max_generated = int(first.get("max_generated_probes") or max_generated)
 
+                # Load pre-generated step candidates from the cache.
+                _step_questions, _step_ids, _step_dicts = _load_and_merge_step_candidates(
+                    conn, sess, dim
+                )
+                if _step_questions:
+                    inference_questions = inference_questions + _step_questions
+                _all_gen_ids: Set[str] = set(sess.generated_question_ids) | _step_ids
+
                 q_metadata = _session_question_metadata(sess)
+                for _sd in _step_dicts:
+                    _sqid = str(_sd.get("id", ""))
+                    if _sqid and _sqid not in q_metadata:
+                        q_metadata[_sqid] = {
+                            "source": "generated",
+                            "calibration_status": "accepted_uncalibrated",
+                            "policy_quality_prior": 0.0,
+                            "risk_penalty": 0.0,
+                        }
+
+                # Helper to determine source including step-cache candidates.
+                def _effective_source(qid: str) -> str:
+                    return "generated" if qid in _all_gen_ids else "seed"
+
                 if strategy == "anchored_exploratory":
                     best, best_score, ranked = select_next_question_exploratory(
                         state,
                         inference_questions,
                         asked_ids=asked,
-                        generated_question_ids=set(sess.generated_question_ids),
+                        generated_question_ids=_all_gen_ids,
                         question_metadata=q_metadata,
                         composition=SessionComposition.scaled(
                             sess.max_inference_questions,
@@ -631,6 +759,46 @@ def get_next_question(
                         for q, eig in _eig_ranked[1:SELECTION_LOG_TOP_K]
                     ]
                     _alt_eig_mode = True
+
+                # If winner is a step-cache candidate, add it to the session pool.
+                if best is not None and best.id in _step_ids:
+                    _cand_dict = next((d for d in _step_dicts if d["id"] == best.id), None)
+                    if _cand_dict is not None:
+                        _pool_ok = False
+                        try:
+                            db.add_candidate_to_session_pool(
+                                conn,
+                                session_id=sess.session_id,
+                                candidate_dict=_cand_dict,
+                                new_generated_id=best.id,
+                            )
+                            db.update_step_candidate_status(
+                                conn, sess.session_id, sess.step, best.id, "selected"
+                            )
+                            _pool_ok = True
+                        except Exception as _exc:  # noqa: BLE001
+                            import warnings
+                            warnings.warn(
+                                f"Failed to add step candidate {best.id} to pool: {_exc}; "
+                                "falling back to best seed candidate.",
+                                stacklevel=2,
+                            )
+                        if not _pool_ok:
+                            _non_cache = [
+                                q for q in inference_questions
+                                if q.id not in asked and q.id not in _step_ids
+                            ]
+                            if _non_cache:
+                                best, best_eig, _ = select_next_question_eig(
+                                    state, _non_cache, asked_ids=asked
+                                )
+                                best_components = {
+                                    "selection_score": float(best_eig),
+                                    "expected_information_gain": float(best_eig),
+                                }
+                            else:
+                                best = None
+
                 if best is None:
                     db.update_session_state(conn, session_id=session_id, status="heldout")
                     return get_next_question(conn, questions_v2_path=questions_v2_path, session_id=session_id, dim=dim)
@@ -644,7 +812,7 @@ def get_next_question(
                         session_id=session_id,
                         step_idx=sess.step,
                         question_id=best.id,
-                        question_source=_question_source(best.id, sess),
+                        question_source=_effective_source(best.id),
                         components=best_components,
                         calibration_status=q_metadata.get(best.id, {}).get("calibration_status"),
                         selected=True,
@@ -656,7 +824,7 @@ def get_next_question(
                             session_id=session_id,
                             step_idx=sess.step,
                             question_id=_alt_q.id,
-                            question_source=_question_source(_alt_q.id, sess),
+                            question_source=_effective_source(_alt_q.id),
                             components=_alt_comps,
                             calibration_status=q_metadata.get(_alt_q.id, {}).get("calibration_status"),
                             selected=False,
@@ -994,3 +1162,154 @@ def get_session_summary(
         "created_at": sess.created_at,
         "updated_at": sess.updated_at,
     }
+
+
+def generate_step_candidates_bg(
+    session_id: str,
+    for_step_idx: int,
+    db_path: str,
+    questions_v2_path: str,
+    llm_api_key: Optional[str],
+    llm_model: Optional[str],
+    dim: int,
+) -> None:
+    """
+    Background task: pre-generate LLM question candidates for the next selection step.
+    Opens its own DB connection so it can safely run after the HTTP response is sent.
+    Stores accepted candidates in step_candidates_cache for pick-up by get_next_question().
+    """
+    import warnings
+    conn = None
+    try:
+        conn = db.connect(db_path)
+        db.init_db(conn)
+
+        # Guards
+        try:
+            sess = db.get_session(conn, session_id)
+        except KeyError:
+            return
+        if sess.status != "inference":
+            return
+        if for_step_idx >= sess.max_inference_questions:
+            return
+        if db.step_candidates_exist(conn, session_id, for_step_idx):
+            return
+        if not should_use_generated_questions(sess.arm) and not (
+            sess.inference_pool and sess.inference_pool[0].get("session_strategy") == "anchored_exploratory"
+        ):
+            return
+
+        # Build qmap and response history for sketch
+        inference_seed, _, qmap = load_bank(questions_v2_path, expected_dim=dim)
+        responses = db.list_responses(conn, session_id)
+        history = _build_response_history_for_sketch(responses, qmap)
+
+        # Generate updated character sketch from current posterior
+        state = _state_from_jsonable(sess.posterior_mu, sess.posterior_sigma)
+        client = make_llm_client(api_key=llm_api_key, model=llm_model)
+        sketch = generate_character_sketch(state, history, client)
+
+        # Update the stored sketch
+        try:
+            db.update_session_sketch(conn, session_id, sketch, step_idx=sess.step)
+        except Exception as exc:  # noqa: BLE001
+            warnings.warn(f"Failed to update session sketch for {session_id}: {exc}", stacklevel=2)
+
+        # Select an active policy for rendering the prompt
+        policy_row = db.get_active_prompt_policy_version(conn)
+        seeds_for_gen = [{"id": q.id, "text": q.text, "w": q.w.tolist()} for q in inference_seed]
+        rendered_prompt: Optional[str] = None
+        policy_version_id: Optional[int] = None
+        if policy_row is not None:
+            policy_version_id = int(policy_row["id"])
+            rendered_prompt = render_prompt_policy(
+                PromptPolicy.from_row(policy_row),
+                seeds_for_gen,
+                2,
+                uncertainty_summary=None,
+                character_sketch=sketch,
+            )
+
+        gen_status = "success"
+        gen_error: Optional[str] = None
+        n_returned = 0
+        gen_result = None
+        try:
+            gen_result = build_generated_pool(
+                client, seeds_for_gen, n_candidates=2, k=3, prompt=rendered_prompt
+            )
+            n_returned = len(gen_result.all_candidates_metadata)
+        except Exception as exc:  # noqa: BLE001
+            gen_status = "failed"
+            gen_error = str(exc)[:500]
+
+        # Log the generation request
+        sigma_arr = np.asarray(sess.posterior_sigma)
+        variances = np.diag(sigma_arr).tolist()
+        gen_request_id: Optional[int] = None
+        try:
+            gen_request_id = db.insert_llm_generation_request(
+                conn,
+                session_id=session_id,
+                user_id=sess.user_id,
+                step_idx=for_step_idx,
+                prompt_policy_version_id=policy_version_id,
+                posterior_mu=sess.posterior_mu,
+                posterior_sigma=sess.posterior_sigma,
+                entropy_before=float(state.entropy()),
+                uncertainty_summary={"entropy": float(state.entropy()), "trait_variances": variances},
+                question_history_summary=None,
+                answer_history_summary=None,
+                unresolved_tensions=None,
+                prompt_rendered=rendered_prompt,
+                model_name=llm_model or DEFAULT_LLM_MODEL,
+                n_requested=2,
+                n_returned=n_returned,
+                status=gen_status,
+                error_message=gen_error,
+                raw_response_text=gen_result.raw_response_text if gen_result else None,
+            )
+        except Exception as exc:  # noqa: BLE001
+            warnings.warn(
+                f"Failed to log generation request for {session_id} step {for_step_idx}: {exc}",
+                stacklevel=2,
+            )
+
+        # Store accepted candidates in step_candidates_cache
+        if gen_result is not None:
+            accepted_dicts = [_jsonable_question_dict(x) for x in gen_result.accepted]
+            for i, cand in enumerate(accepted_dicts):
+                q_id = str(cand.get("id") or f"sc_{session_id[:6]}_{for_step_idx}_{i}")
+                try:
+                    db.insert_step_candidate(
+                        conn,
+                        session_id=session_id,
+                        for_step_idx=for_step_idx,
+                        question_id=q_id,
+                        text=str(cand.get("text", "")),
+                        w=list(cand.get("w") or []),
+                        noise_var=float(cand.get("noise_var") or 1.0),
+                        thresholds=list(cand.get("thresholds") or [-1.5, -0.5, 0.5, 1.5]),
+                        nn_seed_ids=cand.get("nn_seed_ids"),
+                        nn_similarities=cand.get("nn_similarities"),
+                        sketch_mu=sess.posterior_mu,
+                        sketch_sigma=sess.posterior_sigma,
+                        character_sketch=sketch,
+                        generation_request_id=gen_request_id,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    warnings.warn(f"Failed to insert step candidate for {session_id}: {exc}", stacklevel=2)
+
+    except Exception as exc:  # noqa: BLE001
+        import warnings
+        warnings.warn(
+            f"generate_step_candidates_bg failed for {session_id} step {for_step_idx}: {exc}",
+            stacklevel=2,
+        )
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001
+                pass

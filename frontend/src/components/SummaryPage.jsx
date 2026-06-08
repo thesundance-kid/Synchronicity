@@ -27,7 +27,7 @@ function ordinalSuffix(n) {
   return `${n}${s[(n % 10 < 4 ? n % 10 : 0)]}`
 }
 
-export default function SummaryPage({ summary, onRestart }) {
+export default function SummaryPage({ summary, narrative, narrativeLoading, onRestart }) {
   const mu = summary?.posterior?.mu ?? []
   const sigma = summary?.posterior?.sigma ?? []
   const responses = summary?.responses ?? []
@@ -37,8 +37,27 @@ export default function SummaryPage({ summary, onRestart }) {
     <div className="summary">
       <div className="summary-top">
         <h1 className="summary-title">Assessment Complete</h1>
+      </div>
+
+      {/* Narrative portrait — shown first, above the trait chart */}
+      {narrativeLoading && (
+        <div className="narrative-loading">
+          <div className="spinner spinner-sm" />
+          <p className="loading-text">Generating your portrait…</p>
+        </div>
+      )}
+      {!narrativeLoading && narrative && (
+        <div className="narrative-section">
+          {narrative.split('\n\n').map((para, i) => (
+            <p key={i} className="narrative-para">{para}</p>
+          ))}
+        </div>
+      )}
+
+      {/* Big Five trait chart */}
+      <div className="trait-section-header">
         <p className="summary-sub">
-          Your Big Five personality profile, estimated from {inferenceAnswers} adaptive questions.
+          Big Five profile — estimated from {inferenceAnswers} adaptive questions.
         </p>
       </div>
 
